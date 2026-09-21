@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package kvblock;
+
+option go_package = "radixtree/proto/kvblock";
+
+// BlockManagerService coordinates physical KV-cache memory blocks across Device and Host tiers.
+service BlockManagerService {
+  rpc AllocateBlock (AllocateBlockRequest) returns (AllocateBlockResponse);
+  rpc TouchBlock (TouchBlockRequest) returns (TouchBlockResponse);
+  rpc GetBlockLocation (GetBlockLocationRequest) returns (GetBlockLocationResponse);
+  rpc EvictLRU (EvictLRURequest) returns (EvictLRUResponse);
+  rpc WriteBlockData (WriteBlockDataRequest) returns (WriteBlockDataResponse);
+  rpc ReadBlockData (ReadBlockDataRequest) returns (ReadBlockDataResponse);
+}
+
+message AllocateBlockRequest {
+  uint64 sequence_id = 1;
+  uint32 num_tokens = 2;
+  bytes initial_data = 3;
+}
+
+message AllocateBlockResponse {
+  uint64 block_id = 1;
+  string tier = 2;
+  uint32 capacity_bytes = 3;
+}
+
+message TouchBlockRequest {
+  uint64 block_id = 1;
+}
+
+message TouchBlockResponse {
+  bool success = 1;
+}
+
+message GetBlockLocationRequest {
+  uint64 block_id = 1;
+}
+
+message GetBlockLocationResponse {
+  string tier = 1;
+  bool exists = 2;
+  uint32 num_tokens = 3;
+}
+
+message EvictLRURequest {}
+
+message EvictLRUResponse {
+  uint64 evicted_blocks = 1;
+}
+
+message WriteBlockDataRequest {
+  uint64 block_id = 1;
+  uint32 offset = 2;
+  bytes data = 3;
+}
+
+message WriteBlockDataResponse {
+  bool success = 1;
+  uint32 bytes_written = 2;
+}
+
+message ReadBlockDataRequest {
+  uint64 block_id = 1;
+  uint32 offset = 2;
+  uint32 length = 3;
+}
+
+message ReadBlockDataResponse {
+  bytes data = 1;
+  string tier = 2;
+}

@@ -1,0 +1,17 @@
+[package]
+name = "block_manager"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "memory-daemon"
+path = "main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost", "router", "server"] }
+prost = "0.13"
+async-trait = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"

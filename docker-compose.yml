@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  # Rust Tiered Memory Manager (Device VRAM / Host DRAM via gRPC)
+  memory-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: memory-daemon
+    container_name: kv-memory-daemon
+    ports:
+      - "50051:50051"
+    environment:
+      - GRPC_BIND_ADDR=0.0.0.0:50051
+    restart: unless-stopped
+
+  # Go Disaggregated Conductor (Radix Tree prefix cache + OpenAI /v1/chat/completions)
+  conductor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: conductor
+    container_name: kv-conductor
+    ports:
+      - "8080:8080"
+    environment:
+      - DAEMON_ADDR=memory-daemon:50051
+      - PORT=8080
+    depends_on:
+      - memory-daemon
+    restart: unless-stopped
+
+  # Optional: Multi-Agent Swarm Traffic Benchmark Runner
+  benchmark:
+    image: python:3.10-slim
+    container_name: kv-swarm-benchmark
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: >
+      sh -c "pip install --no-cache-dir httpx && python benchmark_agents.py"
+    environment:
+      - CONDUCTOR_URL=http://conductor:8080/generate
+    depends_on:
+      - conductor
+    profiles:
+      - benchmark

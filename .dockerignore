@@ -1,0 +1,12 @@
+.git
+.gitignore
+*.md
+LICENSE
+mnt/
+target/
+radixtree.exe
+*.exe
+__pycache__/
+*.pyc
+.vscode/
+.idea/
