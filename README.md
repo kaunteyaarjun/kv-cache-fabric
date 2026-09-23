@@ -110,7 +110,10 @@ Inspired by the architectures pioneered by **Mooncake** and **Crusoe (MemoryAllo
 ## Verification & Benchmarks
 
 ### 1. Multi-Agent Workload Simulator (`benchmark_agents.py`)
-Autonomous agent swarms operate with long shared system prompts and branching context trees. We tested a 4-agent swarm (Planner, Coder, Auditor, Reviewer) against `http://localhost:8080/generate`:
+Autonomous agent swarms operate with long shared system prompts and branching context trees. We tested a 4-agent swarm (Planner, Coder, Auditor, Reviewer) against `http://localhost:8080/generate`.
+
+> [!NOTE]
+> **Benchmarking Scope & Methodology**: This benchmark measures control-plane dispatch latency ($T_{\text{dispatch}}$), prefix deduplication efficiency, and memory manager coordination under high concurrency. It tests the Go Conductor and Rust daemon without physical 70B GPU weights in the loop, measuring exact request routing, radix tree lock coupling, and gRPC allocation speeds. Complete prefix hits bypass prefill execution entirely.
 
 ```text
 --- RUN 1: Cold System Prompt ---
@@ -123,7 +126,7 @@ Autonomous agent swarms operate with long shared system prompts and branching co
 ```
 
 #### Results:
-- **53% Drop in TTFT**: Time-to-first-token fell from **27.58ms** to **12.87ms** on partial cache hits (Coder & Auditor).
+- **53% Drop in Dispatch Latency ($T_{\text{dispatch}}$)**: First-token dispatch latency fell from **27.58ms** to **12.87ms** on partial cache hits (Coder & Auditor), as 35 physical blocks were resolved instantly from the Radix Tree.
 - **100% Prefill Bypass**: Exact duplicates (Reviewer) completely skipped the prefill engine.
 - **99.3% Prefix Cache Reuse**: 560 out of 564 tokens were served directly from the Radix Tree cache.
 

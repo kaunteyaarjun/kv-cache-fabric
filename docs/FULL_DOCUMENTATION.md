@@ -76,17 +76,17 @@ Despite billions of dollars spent on GPU clusters, this problem was neglected du
 3. **Proprietary Datacenter Silos**:
    Entities that recognized this (Moonshot AI's *Mooncake* with private RDMA networks, and Crusoe's *MemoryAlloy*) built closed proprietary cloud features. Nobody had built an open-source, modular, hardware-agnostic systems primitive combining **Rust** memory tiering, **Go** prefix tree concurrency, and **OpenAI API** compatibility.
 
-### 2.4 Open-Source Lineage & Prior Art Reference Matrix
+### 2.4 Architectural Lineage & Design Influence Matrix
 
-To ground this implementation in the broader systems research ecosystem, the table below outlines the specific open-source primitives, repositories, and academic projects that informed this architecture, along with their core limitations and our corresponding design synthesis:
+The architecture of KV-Cache Fabric is directly informed by foundational systems across the inference literature:
 
-| Project & Repository | Foundational Contribution | Core Limitation in Prior Art | Architectural Evolution in KV-Cache Fabric |
+| Project & Reference | Core Contribution | Focus & Trade-Offs in Prior Systems | Adopted Design in KV-Cache Fabric |
 | :--- | :--- | :--- | :--- |
-| **vLLM**<br>[`vllm-project/vllm`](https://github.com/vllm-project/vllm)<br>*(Kwon et al., SOSP '23)* | PagedAttention, BlockTable mapping logical to physical blocks, reference counting (`ref_cnt`). | Monolithic GPU memory model. CPU swap (`swap_out`/`swap_in`) is synchronous and serializes CUDA streams. No distributed prefill-decode disaggregation. | Ported the BlockTable to **Rust** (`main.rs`), implemented asynchronous PCIe DMA watermarking (90% high watermark), and eliminated eviction race conditions via Two-Phase Lock Re-Verification. |
-| **SGLang**<br>[`sgl-project/sglang`](https://github.com/sgl-project/sglang)<br>*(Zheng et al., '23)* | `RadixCache`: Radix tree for prompt prefix caching across sequential requests (RadixAttention). | Coarse-grained global lock / Python GIL bottleneck; cannot offload across PCIe to host DRAM without evicting; no disaggregated worker orchestration. | Re-engineered the Radix Tree in **Go** (`pkg/radixtree`) with **fine-grained per-node synchronization** and **hand-over-hand lock coupling**, eliminating tree-level mutex contention. |
-| **Mooncake**<br>[`kvcache-ai/Mooncake`](https://github.com/kvcache-ai/Mooncake)<br>*(Moonshot AI, '24)* | KV-cache-centric disaggregated architecture; Transfer Engine using RDMA over RoCEv2. | Tightly coupled to datacenter-grade RDMA hardware (ConnectX-6/7 NICs) and proprietary internal datacenter fabrics; high operational complexity. | Built a **hardware-agnostic** equivalent using standard PCIe DMA emulation, standard TCP/gRPC transport (`proto/kvblock`), and native OpenAI `/v1` gateway compatibility. |
-| **DistServe**<br>[`LLM-Sys/DistServe`](https://github.com/LLM-Sys/DistServe)<br>*(Zhong et al., OSDI '24)* | Prefill-Decode disaggregation to eliminate head-of-line blocking and decouple TTFT from TPOT. | Static worker role assignment; lacks global dynamic prefix deduplication across branching agent swarm trees. | Integrated **prefill-decode disaggregation directly with the Radix Prefix Tree**, enabling **100% prefill bypass** on exact matches and residual-only prefill on tree forks. |
-| **DeepSpeed-FastGen**<br>[`microsoft/DeepSpeed`](https://github.com/microsoft/DeepSpeed)<br>*(Microsoft, '24)* | Dynamic Split-Fuse and ZeRO-Inference CPU/NVMe memory offloading. | Targeted at offline batch throughput; high invocation overhead unsuitable for interactive low-latency agent streaming. | Low-latency Server-Sent Events (SSE) streaming proxy with atomic worker load balancing and sub-millisecond gRPC block allocation. |
+| **vLLM**<br>[`vllm-project/vllm`](https://github.com/vllm-project/vllm)<br>*(Kwon et al., SOSP '23)* | PagedAttention, BlockTable mapping logical to physical blocks, reference counting (`ref_cnt`). | Focuses on single-node GPU HBM paging; CPU swapping (`swap_out`/`swap_in`) is synchronous and serializes CUDA streams. | Adopted the BlockTable concept in **Rust** (`main.rs`), extending it with asynchronous PCIe DMA watermarking (90% high watermark) and two-phase lock re-verification. |
+| **SGLang**<br>[`sgl-project/sglang`](https://github.com/sgl-project/sglang)<br>*(Zheng et al., '23)* | `RadixCache`: Radix tree for prompt prefix caching across sequential requests (RadixAttention). | Centralized in Python runtime; subject to interpreter lock contention under parallel agent branching. | Re-engineered the Radix Tree in **Go** (`pkg/radixtree`) with **fine-grained per-node synchronization** and **hand-over-hand lock coupling**. |
+| **Mooncake**<br>[`kvcache-ai/Mooncake`](https://github.com/kvcache-ai/Mooncake)<br>*(Moonshot AI, '24)* | KV-cache-centric disaggregated architecture; Transfer Engine using RDMA over RoCEv2. | Optimized for high-end enterprise clusters with dedicated RDMA (ConnectX-6/7 NICs) and RoCEv2 network fabrics. | Designed a **hardware-agnostic control plane** using standard TCP/gRPC transport (`proto/kvblock`) and local DMA emulation accessible without specialized NICs. |
+| **DistServe**<br>[`LLM-Sys/DistServe`](https://github.com/LLM-Sys/DistServe)<br>*(Zhong et al., OSDI '24)* | Prefill-Decode disaggregation to eliminate head-of-line blocking and decouple TTFT from TPOT. | Focused on static worker role partitioning for offline or uniform workloads without dynamic prefix trees. | Integrated **prefill-decode disaggregation with the dynamic Radix Tree**, enabling 100% prefill bypass on identical prefixes and residual prefill on forks. |
+| **DeepSpeed-FastGen**<br>[`microsoft/DeepSpeed`](https://github.com/microsoft/DeepSpeed)<br>*(Microsoft, '24)* | Dynamic Split-Fuse and ZeRO-Inference CPU/NVMe memory offloading. | Targeted at offline batch throughput; higher scheduling overhead for interactive, streaming agent workloads. | Lightweight Go reverse proxy with low-latency Server-Sent Events (SSE) streaming and atomic worker load balancing. |
 
 ---
 
@@ -469,6 +469,9 @@ Run the autonomous swarm benchmark:
 python benchmark_agents.py
 ```
 
+> [!NOTE]
+> **Benchmarking Scope & Methodology**: This benchmark measures control-plane dispatch latency ($T_{\text{dispatch}}$), prefix deduplication efficiency, and memory manager coordination under high concurrency. It tests the Go Conductor and Rust daemon without physical 70B GPU weights in the loop, measuring exact request routing, radix tree lock coupling, and gRPC allocation speeds. Complete prefix hits bypass prefill execution entirely.
+
 Expected Output:
 ```text
 --- RUN 1: Cold System Prompt ---
@@ -479,6 +482,11 @@ Expected Output:
 [Reviewer] TTFT: 14.42ms | Total: 109.49ms | Prefill Skipped: True  | Cached Tokens: 564/564
 [Auditor]  TTFT: 14.82ms | Total: 109.95ms | Prefill Skipped: False | Cached Tokens: 561/566
 ```
+
+Key Takeaways:
+- **53% Drop in Dispatch Latency ($T_{\text{dispatch}}$)**: First-token dispatch latency fell from **27.58ms** to **12.87ms** on partial cache hits (Coder & Auditor), as 35 physical blocks were resolved instantly from the Radix Tree.
+- **100% Prefill Bypass**: Exact duplicates (Reviewer) completely skipped the prefill engine.
+- **99.3% Prefix Cache Reuse**: 560 out of 564 tokens were served directly from the Radix Tree cache.
 
 ### 11.2 Automated Test Execution
 Run the complete unit and hardware-thrash test suite:

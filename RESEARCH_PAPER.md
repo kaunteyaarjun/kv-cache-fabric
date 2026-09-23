@@ -11,12 +11,12 @@
 
 Modern Large Language Model (LLM) serving systems face an acute memory wall dominated by Key-Value (KV) cache allocation rather than model weight storage. In multi-agent autonomous swarms—where dozens of concurrent agents share extensive system prompts, tool schemas, and branching conversational trajectories—the aggregate KV cache for 70B+ parameter models rapidly exceeds 80GB, triggering Out-Of-Memory (OOM) faults on modern high-bandwidth memory (HBM) accelerators. 
 
-We present **KV-Cache Fabric**, a disaggregated, hardware-agnostic systems architecture that eliminates this bottleneck through three co-designed subsystems:
-1. **A Tiered Physical Memory Manager in Rust**, which backs logical blocks with contiguous host/device byte buffers, establishes a 90% watermark LRU eviction policy across simulated PCIe Direct Memory Access (DMA) seams, and mathematically resolves the *unlocked-snapshot race condition* via two-phase write-lock re-verification.
-2. **A Concurrent, Fine-Grained Radix Prefix Tree in Go**, which abolishes global mutex contention through hand-over-hand lock coupling down the tree and commits physical block identifiers at strict 16-token boundaries.
+We present **KV-Cache Fabric**, an open-source, disaggregated reference architecture designed to investigate hierarchical memory tiering and concurrent prefix deduplication across three co-designed subsystems:
+1. **A Tiered Physical Memory Manager in Rust**, which backs logical blocks with contiguous host/device byte buffers, establishes a 90% watermark LRU eviction policy across simulated PCIe Direct Memory Access (DMA) seams, and prevents the *unlocked-snapshot race condition* via optimistic two-phase write-lock re-verification.
+2. **A Concurrent, Fine-Grained Radix Prefix Tree in Go**, which eliminates global mutex contention through hand-over-hand lock coupling down the tree and commits physical block identifiers at strict 16-token boundaries.
 3. **A Disaggregated Routing Conductor**, which coordinates compute-bound prefill workers and memory-bound decode workers over gRPC, completely bypassing prefill on 100% prefix cache hits and prefilling only residual suffixes on partial hits.
 
-Empirical evaluation under realistic multi-agent swarm workloads reveals a **53% reduction in Time-To-First-Token (TTFT)**, a **99.3% prefix cache hit rate**, zero deadlocks under 400% hardware over-subscription, and native compatibility with OpenAI-protocol agent orchestrators including CrewAI, LangGraph, and AutoGen.
+Evaluating the control plane under multi-agent swarm traffic shapes demonstrates a **53.3% reduction in control-plane dispatch latency ($\text{T}_{\text{dispatch}}$)**, a **99.3% prefix cache reuse rate**, complete prefill computation bypass on exact duplicate queries, and resilient thread safety under 400% hardware over-subscription.
 
 ---
 
@@ -34,40 +34,34 @@ For a 70-billion parameter model (e.g., LLaMA-3 70B with 80 layers, 8 KV heads, 
 Autonomous agent swarms do not generate isolated, independent query sequences. Instead, they exhibit distinct structural traffic shapes:
 1. **Long Shared System Prefixes**: Every agent in a swarm receives extensive common context: workspace policies, role specifications, execution constraints, and structured JSON tool definitions (typically 1,500 to 4,000 tokens).
 2. **Branching Reasoning Trees**: A planner agent initiates a root task, which forks into concurrent worker branches (e.g., code generation, security auditing, test execution). These branches share 80–95% of their initial prompt tokens.
-3. **Context Window Thrashing**: Extended agentic feedback loops rapidly saturate local GPU VRAM. In traditional monolithic serving engines (e.g., vLLM without external offload), VRAM saturation triggers catastrophic query preemption or abrupt rejection.
+3. **Context Window Thrashing**: Extended agentic feedback loops rapidly saturate local GPU VRAM. In traditional monolithic serving engines (e.g., vLLM without external offload), VRAM saturation triggers query preemption or abrupt rejection.
 
-### 1.2 The Forensic Discovery: Unmasking the 80GB VRAM Anomaly
-During empirical deployments of multi-agent swarms (CrewAI, LangGraph, AutoGen) on quantized 70B models (e.g., LLaMA-3 70B INT4), clusters routinely crashed with CUDA Out-Of-Memory (OOM) faults after just 3 to 5 conversational turns.
+### 1.2 Workload Characterization: The Attention Memory Wall in Agent Swarms
+In multi-agent architectures (such as CrewAI, LangGraph, or AutoGen), prompt prefix duplication across parallel agent personas drives severe accelerator memory pressure. 
 
-The anomaly was stark:
-- A 4-bit quantized 70B model requires $\approx 38\text{ GB}$ of static VRAM.
-- On an 80GB NVIDIA H100 accelerator, over $42\text{ GB}$ of uncommitted memory remained.
-- Yet, serving merely 4 concurrent agents provoked sudden hardware exhaustion.
-
-Forensic telemetry revealed that the VRAM explosion was driven entirely by dynamic Key-Value tensor expansion across redundant prefixes:
+Consider a 4-agent swarm executing against a 70B model in FP16 precision ($320\text{ KB/token}$):
+- Each agent receives an identical 3,000-token system prompt containing environment rules, API contracts, and role guidelines.
+- The shared prefix alone consumes:
 $$\text{Memory}_{\text{agent\_prefix}} = 4 \text{ agents} \times 3,000 \text{ tokens} \times 320 \text{ KB/token} = 3.84 \text{ GB}$$
-By conversational turn 10—as scratchpads, code snippets, and tool schemas accumulated to 8,000 tokens per agent—the cache requirement reached:
+- As scratchpads, code snippets, and conversational history accumulate to 8,000 tokens per agent across iterative reasoning turns, the dynamic cache requirement reaches:
 $$\text{Memory}_{\text{turn\_10}} = 4 \times 8,000 \text{ tokens} \times 320 \text{ KB/token} = \mathbf{10.24 \text{ GB}}$$
-Scaling to a standard enterprise swarm of 32 concurrent agents yields:
+- Scaling to an enterprise deployment of 32 concurrent agents yields:
 $$\text{Memory}_{\text{swarm\_32}} = 32 \times 8,000 \text{ tokens} \times 320 \text{ KB/token} = \mathbf{81.92 \text{ GB}}$$
 
-The accelerator exhausted memory **not due to parameter weights or computational complexity, but due to redundant attention state**. Crucially, over $90\%$ of this data was 100% identical: all 32 agents were redundantly computing and duplicating identical system prompt tensors in disjoint memory buffers. The industry was treating LLMs as stateless point-to-point RPCs, while agent swarms were fundamentally operating as execution trees.
+Crucially, because each agent executes in an isolated session, standard serving engines redundantly allocate disjoint physical memory blocks for identical token sequences. This observation motivates the need for global prefix deduplication paired with hierarchical offloading to lower-cost host memory.
 
-### 1.3 Why Was This Untouched? (The Academic and Industrial Blind Spot)
-Despite the multi-billion-dollar cost implications of GPU memory over-provisioning, an open, modular systems primitive addressing this failure mode remained unbuilt due to three structural factors:
-1. **The Machine Learning vs. Systems Engineering Chasm**:
-   Machine learning researchers focus on attention mathematics, kernel efficiency (FlashAttention), and parameter compression (AWQ, GPTQ). When encountering OOM errors, their instinct is to shrink context windows or apply lossy quantization. Conversely, systems engineers traditionally viewed LLMs as opaque black-box executables accepting string inputs and emitting string outputs, lacking insight into internal attention projection tensor geometries.
-2. **The Monolithic Single-Node Runtime Trap**:
-   Dominant serving engines (vLLM, TGI, Ollama) were architected around a single-node GPU worldview. PagedAttention resolved internal memory fragmentation within GPU HBM, but maintained a binary posture: memory either lived entirely in VRAM or was discarded via query preemption. When memory saturated, the only remedies were query termination or costly recomputation. Treating GPU VRAM as an ephemeral cache layer (L3) backed by cheap CPU host DRAM (Main Memory) was ignored.
-3. **Proprietary Datacenter Silos**:
-   Frontier infrastructure organizations recognized aspects of this paradigm in closed environments (e.g., Moonshot AI's *Mooncake* utilizing private RDMA/RoCEv2 meshes, and Crusoe's *MemoryAlloy*). However, these implementations remained proprietary closed-source cloud features, inaccessible to the broader open-source community.
+### 1.3 Motivation & Architectural Challenges
+While recent breakthrough systems such as **SGLang** (RadixAttention) and **Mooncake** (Kimi) demonstrated the profound value of prefix caching and disaggregated memory pools, several systems challenges remain for general infrastructure:
+1. **Concurrency Bottlenecks**: Python-based control planes in early systems frequently rely on coarse-grained global locks, which experience severe mutex contention when dozens of concurrent agent workers query or mutate the prefix tree simultaneously.
+2. **Hardware Accessibility**: Advanced disaggregation frameworks like Mooncake depend on datacenter-grade RDMA over Converged Ethernet (RoCEv2) meshes and specialized network interface cards (ConnectX-6/7), making deployment challenging in standard cloud compute environments.
+3. **Control-Data Plane Separation**: Bridging a lightweight, high-concurrency compiled control plane (in Go) with a low-level, memory-safe tiering engine (in Rust) requires a modular IPC interface that can operate across local sockets before integrating directly with CUDA driver APIs.
 
 ### 1.4 Research Contributions
-This paper introduces **KV-Cache Fabric**, a production-grade infrastructure primitive that bridges memory-tiering research into a hardware-agnostic, open-source architecture. Our primary contributions are:
-- **Mathematical Resolution of the Lock-Release Eviction Race Condition**: We identify and eliminate a critical concurrency vulnerability in tiered asynchronous memory managers, guaranteeing that blocks pinned mid-transfer are never evicted.
-- **Lock-Coupled Concurrent Radix Tree**: We design and evaluate a Go radix tree operating over token integer sequences using fine-grained per-node synchronization, enabling high-throughput parallel traversal and mutation across disjoint subtrees.
-- **Prefill-Decode Disaggregation with Block-Aligned Prefix Commits**: We demonstrate that committing physical block identifiers at strict block boundaries allows upstream routing proxies to dynamically shorten prefill computations or bypass the prefill phase entirely.
-- **Hardware-Agnostic gRPC Inter-Process Communication**: We provide an IPC boundary over Protocol Buffers decoupling the Go control plane from the Rust memory-tiering daemon, validated against hardware-overcommitted benchmarks and live agent framework integrations.
+This paper presents **KV-Cache Fabric**, a modular reference implementation addressing these challenges. Our key contributions are:
+- **Identification and Resolution of the Lock-Release Eviction Race**: We analyze an asynchronous eviction race condition that arises during non-blocking DMA windows, and resolve it using an optimistic two-phase lock re-verification protocol.
+- **Lock-Coupled Concurrent Radix Tree**: We design a Go-based prefix tree operating over token integer sequences using hand-over-hand lock coupling, enabling parallel traversal and mutation across branching agent subtrees.
+- **Prefill-Decode Disaggregation with Block-Aligned Commits**: We show that committing physical block identifiers at strict 16-token intervals allows the routing conductor to bypass prefill computation completely on identical prompts and prefill only residual suffixes on tree forks.
+- **Resilient IPC Control Plane**: We implement a Protocol Buffers / gRPC boundary featuring bounded deadlines and an atomic circuit breaker that gracefully delegates to local memory when remote daemons are unavailable.
 
 ---
 
@@ -86,17 +80,17 @@ Recent distributed inference research has recognized that prefill (prompt proces
 
 Projects like *DistServe* and *Mooncake* propose physical disaggregation: dedicated prefill nodes process incoming prompts and stream the resulting KV tensors across networks or PCIe buses to decode nodes. Mooncake's *Transfer Engine* leverages RDMA to move tensors between nodes. *Crusoe MemoryAlloy* explores host RAM tiering via PCIe/CXL. *KV-Cache Fabric* builds upon these principles, providing an open, modular systems architecture implementing end-to-end prefix caching, PCIe DMA tiering, and agent swarm routing.
 
-### 2.4 Open-Source Lineage & Prior Art Comparative Reference Matrix
+### 2.4 Architectural Lineage & Design Influence Matrix
 
-The architecture of KV-Cache Fabric is directly situated against prior open-source inference primitives:
+The architecture of KV-Cache Fabric is directly informed by foundational systems across the inference literature:
 
-| Project & Repository | Foundational Systems Primitive | Inherent Architectural Limitation | Synthesis in KV-Cache Fabric |
+| Project & Reference | Core Contribution | Focus & Trade-Offs in Prior Systems | Adopted Design in KV-Cache Fabric |
 | :--- | :--- | :--- | :--- |
-| **vLLM**<br>[`vllm-project/vllm`](https://github.com/vllm-project/vllm)<br>*(Kwon et al., SOSP '23)* | PagedAttention, BlockTable mapping logical to physical blocks, reference counting (`ref_cnt`). | Monolithic GPU memory model. CPU swap (`swap_out`/`swap_in`) is synchronous and stalls GPU stream execution. No cross-node prefill-decode disaggregation. | Ported the BlockTable to **Rust** (`main.rs`), implemented asynchronous PCIe DMA watermarking (90% high watermark), and eliminated eviction race conditions via Two-Phase Lock Re-Verification. |
-| **SGLang**<br>[`sgl-project/sglang`](https://github.com/sgl-project/sglang)<br>*(Zheng et al., '23)* | `RadixCache`: Radix tree for prompt prefix caching across sequential requests (RadixAttention). | Coarse-grained global lock / Python GIL bottleneck; cannot offload across PCIe to host DRAM without evicting; no disaggregated worker orchestration. | Re-engineered the Radix Tree in **Go** (`pkg/radixtree`) with **fine-grained per-node synchronization** and **hand-over-hand lock coupling**, eliminating tree-level mutex contention. |
-| **Mooncake**<br>[`kvcache-ai/Mooncake`](https://github.com/kvcache-ai/Mooncake)<br>*(Moonshot AI, '24)* | KV-cache-centric disaggregated architecture; Transfer Engine using RDMA over RoCEv2. | Tightly coupled to datacenter-grade RDMA hardware (ConnectX-6/7 NICs) and proprietary internal datacenter fabrics; high operational complexity. | Built a **hardware-agnostic** equivalent using standard PCIe DMA emulation, standard TCP/gRPC transport (`proto/kvblock`), and native OpenAI `/v1` gateway compatibility. |
-| **DistServe**<br>[`LLM-Sys/DistServe`](https://github.com/LLM-Sys/DistServe)<br>*(Zhong et al., OSDI '24)* | Prefill-Decode disaggregation to eliminate head-of-line blocking and decouple TTFT from TPOT. | Static worker role assignment; lacks global dynamic prefix deduplication across branching agent swarm trees. | Integrated **prefill-decode disaggregation directly with the Radix Prefix Tree**, enabling **100% prefill bypass** on exact matches and residual-only prefill on tree forks. |
-| **DeepSpeed-FastGen**<br>[`microsoft/DeepSpeed`](https://github.com/microsoft/DeepSpeed)<br>*(Microsoft, '24)* | Dynamic Split-Fuse and ZeRO-Inference CPU/NVMe memory offloading. | Targeted at offline batch throughput; high invocation overhead unsuitable for interactive low-latency agent streaming. | Low-latency Server-Sent Events (SSE) streaming proxy with atomic worker load balancing and sub-millisecond gRPC block allocation. |
+| **vLLM**<br>[`vllm-project/vllm`](https://github.com/vllm-project/vllm)<br>*(Kwon et al., SOSP '23)* | PagedAttention, BlockTable mapping logical to physical blocks, reference counting (`ref_cnt`). | Focuses on single-node GPU HBM paging; CPU swapping (`swap_out`/`swap_in`) is synchronous and serializes CUDA streams. | Adopted the BlockTable concept in **Rust** (`main.rs`), extending it with asynchronous PCIe DMA watermarking (90% high watermark) and two-phase lock re-verification. |
+| **SGLang**<br>[`sgl-project/sglang`](https://github.com/sgl-project/sglang)<br>*(Zheng et al., '23)* | `RadixCache`: Radix tree for prompt prefix caching across sequential requests (RadixAttention). | Centralized in Python runtime; subject to interpreter lock contention under parallel agent branching. | Re-engineered the Radix Tree in **Go** (`pkg/radixtree`) with **fine-grained per-node synchronization** and **hand-over-hand lock coupling**. |
+| **Mooncake**<br>[`kvcache-ai/Mooncake`](https://github.com/kvcache-ai/Mooncake)<br>*(Moonshot AI, '24)* | KV-cache-centric disaggregated architecture; Transfer Engine using RDMA over RoCEv2. | Optimized for high-end enterprise clusters with dedicated RDMA (ConnectX-6/7 NICs) and RoCEv2 network fabrics. | Designed a **hardware-agnostic control plane** using standard TCP/gRPC transport (`proto/kvblock`) and local DMA emulation accessible without specialized NICs. |
+| **DistServe**<br>[`LLM-Sys/DistServe`](https://github.com/LLM-Sys/DistServe)<br>*(Zhong et al., OSDI '24)* | Prefill-Decode disaggregation to eliminate head-of-line blocking and decouple TTFT from TPOT. | Focused on static worker role partitioning for offline or uniform workloads without dynamic prefix trees. | Integrated **prefill-decode disaggregation with the dynamic Radix Tree**, enabling 100% prefill bypass on identical prefixes and residual prefill on forks. |
+| **DeepSpeed-FastGen**<br>[`microsoft/DeepSpeed`](https://github.com/microsoft/DeepSpeed)<br>*(Microsoft, '24)* | Dynamic Split-Fuse and ZeRO-Inference CPU/NVMe memory offloading. | Targeted at offline batch throughput; higher scheduling overhead for interactive, streaming agent workloads. | Lightweight Go reverse proxy with low-latency Server-Sent Events (SSE) streaming and atomic worker load balancing. |
 
 ---
 
@@ -153,14 +147,15 @@ pub struct PhysicalBlock {
 
 Where `BLOCK_SIZE = 16` tokens, `BYTES_PER_TOKEN = 128` bytes, and each block contains a physical contiguous buffer of `BLOCK_BYTES = 2048` bytes.
 
-#### Tier State Invariants
-1. $\forall b \in \mathcal{T}_{\text{device}} \cup \mathcal{T}_{\text{host}}, b.\text{ref\_count} \ge 0$.
-2. If $b.\text{ref\_count} > 0$, $b$ is **pinned** and represents an in-flight computation. It is strictly ineligible for eviction.
-3. Lock acquisition follows a strict hierarchical partial order: $\mathcal{L}(\mathcal{T}_{\text{device}}) \prec \mathcal{L}(\mathcal{T}_{\text{host}})$. A thread requiring locks on both tiers must acquire the Device write lock prior to the Host write lock, mathematically preventing lock-order inversion deadlocks.
+#### Memory Tiering Invariants
+The memory tiering architecture is governed by three systems concurrency invariants:
+1. **Pinned Allocation Safety**: Any block $b$ with `ref_count > 0` represents an in-flight query or active prefill/decode task. Pinned blocks are strictly ineligible for eviction or tier demotion.
+2. **Hierarchical Lock Ordering**: To eliminate lock-order inversion deadlocks across memory tiers, operations requiring locks on both device and host tiers must acquire them in a strict hierarchy: `DeviceTier.write()` precedes `HostTier.write()`.
+3. **Optimistic Concurrency on Asynchronous Boundaries**: Because PCIe DMA transfers execute outside exclusive write lock windows, block metadata captured in a candidate snapshot is treated as optimistic and must be atomically re-verified against current tier state under an exclusive write lock prior to physical mutation.
 
 ---
 
-### 3.2 Formal Analysis of the Lock-Release Eviction Race Condition
+### 3.2 Analysis and Resolution of the Asynchronous Eviction Race Condition
 
 A naive implementation of asynchronous tiered memory eviction suffers from a severe concurrency flaw. Because PCIe DMA transfers (simulated via `cudaMemcpyAsync` or time sleeps) incur significant latency, holding an exclusive write lock across the transfer serializes the entire memory manager. Consequently, naive systems take an unlocked snapshot of cold blocks:
 
@@ -235,9 +230,16 @@ pub async fn evict_lru(&self) -> Result<usize, BlockManagerError> {
 }
 ```
 
-**Theorem 1 (Eviction Safety).** *Under the Two-Phase Verification Protocol, an active block $b$ with $b.\text{ref\_count} > 0$ will never be removed from $\mathcal{T}_{\text{device}}$.*
+#### Eviction Safety via Optimistic Verification
+The safety of this asynchronous workflow is established by two-phase verification:
+1. **Candidate Discovery (Optimistic Phase)**: Under a read lock on the device tier, the evictor gathers candidate blocks with `ref_count == 0` sorted by `last_accessed`. The read lock is promptly released to avoid blocking concurrent query lookups during DMA staging.
+2. **Asynchronous Transfer Window**: The data transfer proceeds across the PCIe seam without holding device tier locks, enabling concurrent workers to continue allocating and reading blocks.
+3. **Lock Reacquisition & Re-Verification (Commit Phase)**: Before modifying physical block tables, the evictor reacquires `device.write()` and `host.write()` in hierarchical order. It inspects the candidate's live state in `device.blocks`:
+   - If a concurrent worker task allocated or pinned the candidate block during the transfer window (`ref_count > 0`), the condition evaluates to `false`.
+   - The eviction is aborted for that block, and the loop advances to the next candidate without unlinking the block.
+   - The block is only unlinked and moved to host memory if its reference count remains strictly zero.
 
-*Proof.* Suppose candidate block $b$ has $b.\text{ref\_count} = 0$ during Phase 1. During the asynchronous transfer window, Worker Thread $W$ acquires `device.write()` and increments $b.\text{ref\_count} = 1$. When Evictor Thread $E$ reacquires `device.write()`, it evaluates `is_still_evictable`. By the mutual exclusion of `device.write()`, $E$ observes $b.\text{ref\_count} = 1$. The condition evaluates to `false`, the `continue` statement executes, and `device.remove(b.block_id)` is bypassed. $\blacksquare$
+This guarantees that active, in-flight attention tensors are never unlinked or corrupted during concurrent query spikes, preserving linearizability without serializing the memory manager over the PCIe transfer latency.
 
 ---
 
@@ -402,11 +404,17 @@ The system was engineered across a polyglot stack optimized for memory safety, l
 
 ## 4. Empirical Evaluation
 
-We evaluated KV-Cache Fabric to measure prefix caching efficiency, Time-To-First-Token latency reductions, and memory stability under acute hardware over-subscription.
+We evaluated KV-Cache Fabric to measure prefix caching efficiency, control-plane dispatch latency reductions, and memory stability under acute hardware over-subscription.
 
 ### 4.1 Multi-Agent Workload Simulator Benchmark
 
-To reflect production agent traffic, we developed a deterministic benchmark ([`benchmark_agents.py`](file:///c:/Users/somya/Downloads/kv-cache-fabric/benchmark_agents.py)) modeling an autonomous software development swarm. The swarm shares an extensive system prompt prefix ($\sim 560$ tokens) specifying agent personas, formatting rules, and tool calling definitions.
+#### Evaluation Scope & Methodology
+To isolate the control-plane routing, lock coupling, and memory management overheads from model FLOP execution times, our evaluation benchmarks the Go Conductor and Rust daemon using a multi-agent workload simulator ([`benchmark_agents.py`](file:///c:/Users/somya/Downloads/kv-cache-fabric/benchmark_agents.py)). 
+
+> [!NOTE]
+> **Evaluation Scope**: This benchmark evaluates control-plane dispatch latency ($T_{\text{dispatch}}$), prefix deduplication efficiency, and tiered memory allocation under high concurrency. It does not run live forward-pass weight computations on a physical 70B parameter GPU. Instead, it measures the exact time spent in HTTP request parsing, hand-over-hand radix tree traversal, gRPC memory allocation, and token routing. Suffix tokens undergo simulated decode dispatch, while complete prefix hits bypass prefill execution entirely.
+
+The benchmark models an autonomous software development swarm sharing an extensive system prompt prefix ($\sim 560$ tokens) specifying agent personas, formatting rules, and tool calling definitions.
 
 The benchmark executes four heterogeneous agents:
 1. **Planner (Cold Start)**: `SHARED_SYSTEM_PROMPT` + `"Task: Plan database schema."`
@@ -416,8 +424,8 @@ The benchmark executes four heterogeneous agents:
 
 Run 1 executes the Planner to establish baseline cold latency. Run 2 dispatches Coder, Auditor, and Reviewer concurrently over asynchronous HTTP/SSE connections.
 
-#### Table 1: Multi-Agent Benchmark Telemetry
-| Agent | Execution Mode | Total Tokens | Cached Tokens | Cache Hit Ratio | Prefill Skipped | TTFT (ms) | Total Latency (ms) |
+#### Table 1: Multi-Agent Benchmark Telemetry (Control-Plane Dispatch & Prefix Routing)
+| Agent | Execution Mode | Total Tokens | Cached Tokens | Cache Hit Ratio | Prefill Skipped | First-Token Dispatch $T_{\text{dispatch}}$ (ms) | Total Latency (ms) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Planner** | Cold Start | 564 | 0 | 0.0% | **False** | 27.58 ms | 122.58 ms |
 | **Coder** | Concurrent Branch | 564 | 560 | **99.3%** | **False** | **12.87 ms** | 106.98 ms |
@@ -425,11 +433,11 @@ Run 1 executes the Planner to establish baseline cold latency. Run 2 dispatches 
 | **Reviewer** | Exact Duplicate | 564 | 564 | **100.0%** | **True** | **14.42 ms** | 109.49 ms |
 
 #### Key Empirical Observations:
-1. **53.3% Latency Drop on Branching Lookups**: Coder and Auditor experienced an immediate reduction in TTFT from $27.58\text{ ms}$ to $12.87\text{ ms}$ and $14.82\text{ ms}$. Because 35 physical blocks (`blk-1` through `blk-35`) were retrieved from the Radix Tree, the prefill engine processed only the 4 residual suffix tokens.
-2. **Complete Prefill Elimination on Duplicates**: Reviewer achieved a 100% cache hit, bypassing prefill entirely and routing directly to token decoding.
+1. **53.3% Reduction in Control-Plane Dispatch Overhead on Branching Lookups**: Coder and Auditor experienced an immediate reduction in first-token dispatch latency ($T_{\text{dispatch}}$) from $27.58\text{ ms}$ to $12.87\text{ ms}$ and $14.82\text{ ms}$. Because 35 physical blocks (`blk-1` through `blk-35`) were retrieved directly from the Radix Tree, only the 4 residual suffix tokens required allocation and dispatch.
+2. **Complete Prefill Elimination on Duplicates**: Reviewer achieved a 100% cache hit, bypassing prefill computation completely and routing directly into the token generation loop.
 
 ```
-Time-To-First-Token (TTFT) Comparison
+First-Token Dispatch Latency (T_dispatch) Comparison
 ──────────────────────────────────────────────────────────────────────────
 Planner (Cold Miss)      ████████████████████████████ 27.58 ms
 Coder (99.3% Prefix Hit) █████████████ 12.87 ms (-53.3%)
@@ -529,7 +537,7 @@ The memory wall of Large Language Model inference cannot be solved by parameter 
 2. **Lock-coupled concurrent prefix trees with block-aligned commits**, and
 3. **Prefill-decode disaggregation**,
 
-achieves a **53% reduction in Time-To-First-Token** while providing absolute stability under severe accelerator memory over-subscription. By releasing this system as an open-source primitive, we provide a foundational building block for the next generation of disaggregated agent infrastructure.
+achieves a **53% reduction in first-token control-plane dispatch latency** and complete prefill compute elimination for repeated prefixes, while providing absolute stability under severe accelerator memory over-subscription. By releasing this system as an open-source primitive, we provide a foundational building block for the next generation of disaggregated agent infrastructure.
 
 ---
 
