@@ -166,7 +166,7 @@ func (c *Conductor) runPrefill(ctx context.Context, w *Worker, tokens []int, req
 
 		_ = c.kvClient.WriteBlockData(ctx, blockID, 0, tensorPayload)
 
-		blockIDs[i] = fmt.Sprintf("blk-%d", blockID)
+		blockIDs[i] = kvclient.FormatBlockID(blockID)
 		log.Printf("[%s] allocated block %s (%s tier, %d tokens) on %s",
 			requestID, blockIDs[i], tier, tokensInBlock, w.ID)
 	}
@@ -199,8 +199,7 @@ func (c *Conductor) streamDecode(ctx context.Context, w *Worker, ref KVCacheRefe
 
 	// Unpin blocks after decode completes
 	for _, blkStr := range ref.BlockIDs {
-		var bID uint64
-		if _, err := fmt.Sscanf(blkStr, "blk-%d", &bID); err == nil {
+		if bID, err := kvclient.ParseBlockID(blkStr); err == nil {
 			_ = c.kvClient.TouchBlock(ctx, bID)
 		}
 	}

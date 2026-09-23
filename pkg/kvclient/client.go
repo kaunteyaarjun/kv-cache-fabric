@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,7 +22,31 @@ type TierLocation string
 const (
 	TierDevice TierLocation = "DEVICE"
 	TierHost   TierLocation = "HOST"
+
+	// DefaultRPCTimeout guards gRPC operations from stalling indefinitely if the daemon drops.
+	DefaultRPCTimeout = 250 * time.Millisecond
 )
+
+// FormatBlockID returns the canonical string representation for a physical block ID.
+// Uses fast ASCII formatting to avoid reflection/fmt allocations.
+func FormatBlockID(id uint64) string {
+	return "blk-" + strconv.FormatUint(id, 10)
+}
+
+// ParseBlockID extracts the numeric block ID from canonical representations:
+// - "blk-123" (remote Rust daemon blocks)
+// - "local-blk-123" (namespaced local fallback blocks)
+// - "123" (raw numeric strings)
+// Returns an error if the format is invalid.
+func ParseBlockID(s string) (uint64, error) {
+	if strings.HasPrefix(s, "blk-") {
+		return strconv.ParseUint(s[4:], 10, 64)
+	}
+	if strings.HasPrefix(s, "local-blk-") {
+		return strconv.ParseUint(s[10:], 10, 64)
+	}
+	return strconv.ParseUint(s, 10, 64)
+}
 
 type localBlock struct {
 	id           uint64
@@ -31,15 +57,15 @@ type localBlock struct {
 	lastAccessed time.Time
 }
 
-// Client wraps the gRPC connection to the Rust BlockManagerService with a high-fidelity
-// local tiered fallback that models the 8-block Device / 32-block Host memory hierarchy.
+// Client wraps the gRPC connection to the Rust BlockManagerService with a resilient
+// local tiered fallback modeling the 8-block Device / 32-block Host memory hierarchy.
 type Client struct {
 	addr          string
 	conn          *grpc.ClientConn
 	rpc           kvblock.BlockManagerServiceClient
-	fallbackLocal bool
+	fallbackLocal uint32 // 0 = active gRPC, 1 = tripped to local fallback
 
-	// Local tiered memory simulation (when gRPC server is offline)
+	// Local tiered memory simulation (when gRPC server is offline or drops mid-stream)
 	mu             sync.Mutex
 	deviceCapacity int
 	hostCapacity   int
@@ -68,11 +94,13 @@ func NewClient(addr string) (*Client, error) {
 		hostCapacity:   32,
 		deviceBlocks:   make(map[uint64]*localBlock),
 		hostBlocks:     make(map[uint64]*localBlock),
+		// Offset sequence counter to prevent namespace collision with remote 1-indexed daemon IDs
+		seqCounter: 1_000_000,
 	}
 
 	if err != nil {
 		log.Printf("[kvclient] notice: Rust BlockManager gRPC server at %s not reachable (%v). Using local tiered fallback (8 Device / 32 Host blocks).", addr, err)
-		c.fallbackLocal = true
+		atomic.StoreUint32(&c.fallbackLocal, 1)
 		return c, nil
 	}
 
@@ -90,18 +118,40 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// isFallback checks if the client is operating in local fallback mode.
+func (c *Client) isFallback() bool {
+	return atomic.LoadUint32(&c.fallbackLocal) == 1
+}
+
+// tripCircuitBreaker atomically switches the client to local memory fallback upon connection failure.
+func (c *Client) tripCircuitBreaker(err error, op string) {
+	if atomic.CompareAndSwapUint32(&c.fallbackLocal, 0, 1) {
+		log.Printf("[kvclient] ⚠️ Circuit breaker tripped during %s: %v. Switched to resilient local tiered engine.", op, err)
+	}
+}
+
+// rpcDeadline derives a bounded execution context to guarantee no gRPC operation hangs indefinitely.
+func (c *Client) rpcDeadline(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, DefaultRPCTimeout)
+}
+
 // AllocateBlock allocates a block in the Device tier, triggering LRU eviction to Host if usage >= 90%.
 func (c *Client) AllocateBlock(ctx context.Context, seqID uint64, numTokens uint32, initialData []byte) (uint64, string, error) {
-	if c.rpc != nil && !c.fallbackLocal {
-		resp, err := c.rpc.AllocateBlock(ctx, &kvblock.AllocateBlockRequest{
+	if c.rpc != nil && !c.isFallback() {
+		callCtx, cancel := c.rpcDeadline(ctx)
+		resp, err := c.rpc.AllocateBlock(callCtx, &kvblock.AllocateBlockRequest{
 			SequenceId:  seqID,
 			NumTokens:   numTokens,
 			InitialData: initialData,
 		})
+		cancel()
 		if err == nil {
 			return resp.BlockId, resp.Tier, nil
 		}
-		log.Printf("[kvclient] gRPC AllocateBlock failed: %v; falling back", err)
+		c.tripCircuitBreaker(err, "AllocateBlock")
 	}
 
 	c.mu.Lock()
@@ -198,16 +248,21 @@ func (c *Client) localEvictLRU() int {
 
 // TouchBlock refreshes the LRU timestamp and decrements refCount if generation is complete.
 func (c *Client) TouchBlock(ctx context.Context, blockID uint64) error {
-	if c.rpc != nil && !c.fallbackLocal {
-		_, err := c.rpc.TouchBlock(ctx, &kvblock.TouchBlockRequest{BlockId: blockID})
-		return err
+	if c.rpc != nil && !c.isFallback() {
+		callCtx, cancel := c.rpcDeadline(ctx)
+		_, err := c.rpc.TouchBlock(callCtx, &kvblock.TouchBlockRequest{BlockId: blockID})
+		cancel()
+		if err == nil {
+			return nil
+		}
+		c.tripCircuitBreaker(err, "TouchBlock")
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if blk, ok := c.deviceBlocks[blockID]; ok {
-		blk.lastAccessed = time.Now();
+		blk.lastAccessed = time.Now()
 		// Mark unpinned so it becomes candidate for LRU eviction once idle
 		blk.refCount = 0
 		return nil
@@ -222,19 +277,20 @@ func (c *Client) TouchBlock(ctx context.Context, blockID uint64) error {
 
 // WriteBlockData stores tensor bytes in the target block.
 func (c *Client) WriteBlockData(ctx context.Context, blockID uint64, offset uint32, data []byte) error {
-	if c.rpc != nil && !c.fallbackLocal {
-		resp, err := c.rpc.WriteBlockData(ctx, &kvblock.WriteBlockDataRequest{
+	if c.rpc != nil && !c.isFallback() {
+		callCtx, cancel := c.rpcDeadline(ctx)
+		resp, err := c.rpc.WriteBlockData(callCtx, &kvblock.WriteBlockDataRequest{
 			BlockId: blockID,
 			Offset:  offset,
 			Data:    data,
 		})
+		cancel()
+		if err == nil && resp.Success {
+			return nil
+		}
 		if err != nil {
-			return err
+			c.tripCircuitBreaker(err, "WriteBlockData")
 		}
-		if !resp.Success {
-			return fmt.Errorf("write to block %d failed", blockID)
-		}
-		return nil
 	}
 
 	c.mu.Lock()
@@ -261,16 +317,18 @@ func (c *Client) WriteBlockData(ctx context.Context, blockID uint64, offset uint
 
 // ReadBlockData retrieves tensor bytes from the target block.
 func (c *Client) ReadBlockData(ctx context.Context, blockID uint64, offset, length uint32) ([]byte, string, error) {
-	if c.rpc != nil && !c.fallbackLocal {
-		resp, err := c.rpc.ReadBlockData(ctx, &kvblock.ReadBlockDataRequest{
+	if c.rpc != nil && !c.isFallback() {
+		callCtx, cancel := c.rpcDeadline(ctx)
+		resp, err := c.rpc.ReadBlockData(callCtx, &kvblock.ReadBlockDataRequest{
 			BlockId: blockID,
 			Offset:  offset,
 			Length:  length,
 		})
-		if err != nil {
-			return nil, "", err
+		cancel()
+		if err == nil {
+			return resp.Data, resp.Tier, nil
 		}
-		return resp.Data, resp.Tier, nil
+		c.tripCircuitBreaker(err, "ReadBlockData")
 	}
 
 	c.mu.Lock()
