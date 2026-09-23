@@ -365,40 +365,34 @@ message AllocateBlockResponse {
 
 ---
 
-### 3.6 Critical Engineering Challenges & Resolved Concurrency Pitfalls
+### 3.6 Systems Invariants and Concurrency Considerations
 
-Building a production-grade disaggregated memory fabric exposed four fundamental systems engineering vulnerabilities that were systematically identified and resolved:
+Deploying a multi-language disaggregated architecture exposes several subtle failure modes across synchronization, transport, and memory lifecycle boundaries:
 
-#### 3.6.1 The "Ghost" Eviction Race Condition (Unlocked Snapshot Vulnerability)
-*Problem*: In naive tiered asynchronous memory architectures, eviction is implemented by acquiring a read-lock on the device tier, snapshotting cold blocks where `ref_count == 0`, and releasing the lock prior to initiating the high-latency PCIe DMA transfer. During this unlocked transfer window, concurrent inference workers allocate or pin candidate blocks (`ref_count = 1`) to write attention tensors for active queries. If the evictor reacquires the write lock and deletes the block unconditionally, active generation blocks are destroyed, causing immediate memory corruption, kernel panics, and garbled output.  
-*Resolution*: We formulated the **Two-Phase Lock Re-Verification Protocol** (Section 3.2). Upon reacquiring `device.write()`, the evictor atomically verifies that `curr.ref_count == 0`. If a block was pinned mid-transfer, eviction is aborted for that block, mathematically guaranteeing memory safety under high concurrency.
+#### 3.6.1 Stale-State Verification Across Asynchronous Eviction Boundaries
+In naive tiered architectures, eviction gathers candidate blocks under a read lock, drops the lock to avoid blocking during the high-latency transfer window, and unconditionally deletes the block once the transfer finishes. Under concurrent agent workloads, an inference worker may pin a candidate block (`ref_count > 0`) during this transfer window. Unconditional removal would destroy an active query block, resulting in memory corruption or process panics. As detailed in Section 3.2, our Two-Phase Verification Protocol ensures that upon re-acquiring the exclusive lock, the candidate is re-verified; if the block was pinned or modified during the transfer window, eviction safely aborts, preserving memory linearizability without serializing throughput over the PCIe transfer boundary.
 
-#### 3.6.2 Global Lock Contention vs. Lock-Coupled Radix Trees
-*Problem*: Early implementations of prefix trees protect the root with a single `sync.RWMutex`. Under multi-agent swarm traffic (dozens of agents concurrently traversing and extending branching conversation trees), CPU profiling revealed that over $80\%$ of runtime was spent blocked in `sync.runtime_SemacquireMutex`, serializing independent requests.  
-*Resolution*: We eliminated the global tree mutex completely in favor of fine-grained per-node synchronization and **hand-over-hand lock coupling** (`Algorithm 1`). Readers acquire `child.mu.RLock()` before releasing `parent.mu.RUnlock()`. Concurrent agents operating on disjoint reasoning branches experience zero lock contention.
+#### 3.6.2 Lock Coupling vs. Tree Mutex Contention
+Early prefix caching implementations protected the root node with a single mutual exclusion lock. In multi-agent swarms where dozens of workers concurrently traverse and extend conversation branches, profiling indicates that threads spend the majority of execution time waiting on lock acquisition. By adopting hand-over-hand lock coupling (`Algorithm 1`) with per-node `sync.RWMutex` primitives, readers hold at most two adjacent read locks during traversal, and writers lock only the mutated parent and child nodes, allowing parallel progress across disjoint subtrees.
 
-#### 3.6.3 Physical Block-Boundary Alignment vs. Arbitrary Prefix Slicing
-*Problem*: Standard radix trees operate on character or token slices of arbitrary length. However, physical PCIe DMA and GPU memory engines transfer memory exclusively in fixed-size blocks (`BLOCK_SIZE = 16`). Slicing mid-block creates an un-cacheable orphan state because partial KV tensors cannot be transferred or addressed independently.  
-*Resolution*: The Conductor enforces **Block-Aligned Boundary Commits**. Block IDs are registered in the prefix tree at strict 16-token intervals ($\text{tokens}[0 : 16k] \implies \text{BlockID}_k$). `MatchPrefix` stops at whole block boundaries, ensuring that cached tokens always correspond 1-to-1 with complete physical memory buffers.
+#### 3.6.3 Block-Aligned Boundary Commits
+Radix trees natively operate on arbitrary sequence prefixes. However, physical memory managers and DMA hardware transfer KV tensors in discrete block increments (`BLOCK_SIZE = 16`). Slicing sequences at arbitrary boundaries would produce un-cacheable orphan fragments. The Conductor addresses this by enforcing block-aligned boundary commits ($\text{tokens}[0 : 16k] \implies \text{BlockID}_k$). Traversal matches complete block intervals, guaranteeing that cached tokens map 1-to-1 with physical buffers and leaving only residual suffix tokens for prefill.
 
-#### 3.6.4 Extreme Hardware Thrashing & Saturated Host DRAM Offload
-*Problem*: When 16 concurrent agents fire queries simultaneously on a capacity-constrained 8-block device tier, all 16 hold active prefill references (`ref_count > 0`). Because the evictor refuses to evict active queries, the device tier hits 100% saturation with zero evictable candidates. In monolithic systems, this triggers immediate Out-Of-Memory termination or deadlock.  
-*Resolution*: We implemented **Saturated Host DRAM Offload**. When the device tier is fully occupied by in-flight pinned blocks, the allocator dynamically provisions blocks directly in Host CPU DRAM (`TierHost`). The system absorbs 400% traffic spikes in cheap host memory without stalling, re-balancing blocks across PCIe once worker queries complete.
+#### 3.6.4 Dynamic Host DRAM Overflow Under Memory Pressure
+When concurrent requests saturate physical accelerator memory with in-flight pinned blocks (`ref_count > 0`), the evictor cannot reclaim blocks without corrupting active queries. To prevent request dropping or abrupt out-of-memory faults, the allocator provides dynamic host DRAM overflow: new allocations exceeding device capacity spill directly into host memory (`TierLocation::Host`), maintaining system availability under acute over-subscription until active device queries release their blocks.
 
-#### 3.6.5 Cascading IPC Failures & Atomic Circuit Breaking
-*Problem*: In distributed inference deployments, unexpected termination or high scheduling jitter in the memory daemon causes client RPC calls to hang indefinitely on socket read operations. In high-concurrency agent swarms, dozens of goroutines pile up waiting on dead sockets, rapidly exhausting the proxy's connection pool and causing total service unavailability.  
-*Resolution*: We implemented **Bounded Deadlines and an Atomic Circuit Breaker** in `pkg/kvclient/client.go`. Every RPC operation is bounded by a strict `DefaultRPCTimeout = 250ms` context deadline. Upon detecting an RPC failure or timeout, an atomic compare-and-swap operation (`atomic.CompareAndSwapUint32`) trips the client into local fallback mode. Subsequent calls bypass gRPC in zero nanoseconds and execute against the local tiered engine, ensuring zero unhandled client-side failures.
+#### 3.6.5 Bounded Deadlines and Atomic Circuit Breaking
+In distributed deployments, transient daemon crashes or network latency spikes can cause control-plane goroutines to stall indefinitely on blocking RPC reads, rapidly exhausting proxy connection pools. We bound all RPC operations with a 250ms context deadline. Upon encountering consecutive timeouts or transport failures, an atomic compare-and-swap transition (`atomic.CompareAndSwapUint32`) trips an internal circuit breaker, redirecting memory requests to an embedded local tiered engine with zero nanoseconds of network overhead.
 
-#### 3.6.6 Disjoint Namespace Partitioning & Zero-Allocation Block ID Parsing
-*Problem*: If remote and local allocators both generate 1-indexed atomic block IDs, a client failover event produces identical block keys (`blk-1`, `blk-2`), causing the Radix Tree to serve stale or corrupted attention tensors. Furthermore, standard formatted scanning (`fmt.Sscanf`) in the per-token decode loop introduces heavy heap reflection overhead.  
-*Resolution*: We implemented **Disjoint Namespace Partitioning** and **Zero-Allocation Parsers**. The local fallback allocator is offset to $1,000,000+$, guaranteeing that remote accelerator blocks ($[1, 999,999]$) and local fallback blocks ($[1,000,000, \infty)$) occupy disjoint numerical partitions. Parsing is implemented using `FormatBlockID` and `ParseBlockID` with `strconv.ParseUint`, operating at raw CPU register speed with zero heap allocations during active token generation.
+#### 3.6.6 Disjoint Namespace Partitioning and Zero-Allocation Decoding
+When control transitions between remote and local allocators, 1-indexed sequential block IDs could collide, causing the prefix tree to reference incorrect physical tensors. We prevent ID collision by partitioning the namespace: remote accelerator blocks occupy $[1, 999,999]$, while local fallback allocations begin at $[1,000,000, \infty)$. To eliminate garbage collection overhead in the high-frequency decode loop, block ID formatting and parsing are implemented with direct integer conversion (`strconv.ParseUint`) rather than reflection-based string scanning (`fmt.Sscanf`), avoiding heap allocations on the hot path.
 
-### 3.7 Polyglot Implementation Architecture (How It Was Built)
-The system was engineered across a polyglot stack optimized for memory safety, low-latency concurrency, and drop-in usability:
-- **Rust (Systems Tiering Daemon)**: Implements deterministic zero-cost physical buffer allocation (`PhysicalBlock.data`), hierarchical lock ordering ($\mathcal{L}(\mathcal{T}_{\text{device}}) \prec \mathcal{L}(\mathcal{T}_{\text{host}})$), and asynchronous PCIe DMA latency modeling wrapped in a high-throughput Tonic gRPC server.
-- **Go (Control Plane & Routing Proxy)**: Manages lightweight goroutines, HTTP Server-Sent Events (SSE) streaming, and the fine-grained lock-coupled Radix Tree.
-- **Protocol Buffers / gRPC**: Low-overhead binary serialization bridging Go and Rust over localhost with sub-millisecond RPC latency.
-- **OpenAI-Compatible Gateway**: Exposes native `/v1/chat/completions` with `prompt_tokens_details.cached_tokens`, providing seamless integration for CrewAI, LangGraph, and AutoGen swarms.
+### 3.7 Prototype Implementation
+The prototype is implemented across a modular polyglot stack:
+- **Systems Tiering Daemon (Rust)**: Manages physical contiguous memory buffers, implements the two-phase lock re-verification protocol with hierarchical tier locking, and exposes memory management RPCs via Tonic gRPC.
+- **Routing Conductor & Prefix Tree (Go)**: Manages the hand-over-hand lock-coupled radix tree, dynamic prefill/decode worker load balancing, and Server-Sent Events (SSE) streaming.
+- **Transport Interface (Protocol Buffers / gRPC)**: Provides typed RPC contracts over local Unix/TCP sockets with sub-millisecond invocation overhead.
+- **OpenAI-Compatible Gateway**: Exposes standard `/v1/chat/completions` endpoints supporting prompt cache attribution (`prompt_tokens_details.cached_tokens`) for integration with agent orchestration frameworks.
 
 ---
 
