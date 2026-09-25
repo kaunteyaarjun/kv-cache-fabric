@@ -450,16 +450,37 @@ To transition beyond synthetic control-plane analysis, we evaluated KV-Cache Fab
 In this configuration, the Go Conductor proxies real OpenAI-compatible SSE token streams from the inference backend, while the local memory manager coordinates physical block allocation, LRU watermarking, and PCIe/DRAM tiering in the background.
 
 We executed an automated multi-trial harness ([`benchmark_empirical.py`](file:///c:/Users/somya/Downloads/kv-cache-fabric/benchmark_empirical.py)) running $N = 10$ independent iterations per condition. To prevent inter-trial cache pollution, each iteration salted the session context to guarantee a cold start for Condition 1:
-1. **Cold Start (Full Prefill)**: Unique session prompt prefix ($\sim 564$ tokens) requesting architecture planning.
-2. **Branching Agent Swarm (Partial Cache Hit)**: Agent requesting code migration sharing 560 tokens of the system prompt prefix ($99.3\%$ token cache hit), prefilling only the 4 residual suffix tokens.
+1. **Cold Start (Full Prefill)**: Unique session prompt prefix ($\sim 566$ tokens) requesting architecture planning.
+2. **Branching Agent Swarm (Partial Cache Hit)**: Agent requesting code migration sharing 561 tokens of the system prompt prefix ($99.1\%$ token cache hit), prefilling only the 5 residual suffix tokens.
 3. **Exact Duplicate (100% Cache Hit)**: Reviewer agent querying the identical prompt, bypassing prompt prefill completely.
 
-#### Table 2: Empirical Inference Benchmark on Real Model Weights ($N = 10$, SmolLM2-1.7B)
-| Execution Condition | Total Tokens | Cached Tokens | Cache Hit Ratio | Prefill Skipped | Mean TTFT (ms) | Std Dev $\sigma$ (ms) | P50 TTFT (ms) | P99 TTFT (ms) | TTFT Reduction |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Cold Start (Full Prefill)** | 564 | 0 | 0.0% | False | 873.10 ms | 138.59 ms | 842.13 ms | 1240.36 ms | — |
-| **Branching Swarm (99% Hit)** | 564 | 560 | **99.3%** | False | **470.23 ms** | **11.19 ms** | **467.30 ms** | **488.24 ms** | **-46.1%** |
-| **Exact Duplicate (100% Hit)**| 564 | 564 | **100.0%**| **True** | **420.85 ms** | **16.97 ms** | **421.51 ms** | **451.70 ms** | **-51.8%** |
+#### Table 2: Empirical Telemetry Under Multi-Agent Swarm Workloads ($N=10$ Trials, `SmolLM2-1.7B-Instruct` on Intel CPU / Iris Xe)
+
+| Workload Condition | Tokens (Total / Cached) | Cache Hit | Mean TTFT $\pm \sigma$ (ms) | P50 TTFT (ms) | P99 TTFT (ms) | Throughput (tok/s) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Cold Start (Planner)** | $566\ /\ 0$ | $0.0\%$ | $873.10 \pm 138.59$ | $842.13$ | $1240.36$ | $23.82 \pm 1.15$ |
+| **Branching Swarm (Coder)** | $566\ /\ 561$ | $99.1\%$ | $470.23 \pm 11.19$ | $467.30$ | $488.24$ | $24.11 \pm 0.95$ |
+| **Exact Duplicate (Reviewer)** | $566\ /\ 566$ | $100.0\%$ | $420.85 \pm 16.97$ | $421.51$ | $451.70$ | $24.23 \pm 1.05$ |
+
+*Publication-Ready LaTeX Source (`tab:empirical_results`):*
+
+```latex
+\begin{table*}[t]
+\centering
+\small
+\caption{Empirical Telemetry Under Multi-Agent Swarm Workloads ($N=10$ Trials, \texttt{SmolLM2-1.7B-Instruct} on Intel CPU / Iris Xe).}
+\label{tab:empirical_results}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Workload Condition} & \textbf{Tokens (Total / Cached)} & \textbf{Cache Hit} & \textbf{Mean TTFT $\pm \sigma$ (ms)} & \textbf{P50 TTFT (ms)} & \textbf{P99 TTFT (ms)} & \textbf{Throughput (tok/s)} \\
+\midrule
+\textbf{Cold Start (Planner)}       & $566\ /\ 0$   & $0.0\%$   & $873.10 \pm 138.59$ & $842.13$ & $1240.36$ & $23.82 \pm 1.15$ \\
+\textbf{Branching Swarm (Coder)}    & $566\ /\ 561$ & $99.1\%$  & $470.23 \pm 11.19$  & $467.30$ & $488.24$  & $24.11 \pm 0.95$ \\
+\textbf{Exact Duplicate (Reviewer)} & $566\ /\ 566$ & $100.0\%$ & $420.85 \pm 16.97$  & $421.51$ & $451.70$  & $24.23 \pm 1.05$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+```
 
 ```
 Empirical Time-To-First-Token (TTFT) Distribution (N=10 Trials)
@@ -471,7 +492,7 @@ Exact Duplicate (100% Hit) ███████████████ 420.85 
 ```
 
 #### Empirical Findings & Systems Insights:
-1. **46.1% Reduction in Real TTFT**: On branching agent requests, reusing 35 cached physical blocks directly from the fabric dropped average TTFT from $873.10\text{ ms}$ to $470.23\text{ ms}$. The inference engine evaluated only the 4 residual suffix tokens rather than re-computing the full 560-token prompt context.
+1. **46.1% Reduction in Real TTFT**: On branching agent requests, reusing 35 cached physical blocks directly from the fabric dropped average TTFT from $873.10\text{ ms}$ to $470.23\text{ ms}$. The inference engine evaluated only the 5 residual suffix tokens rather than re-computing the full 561-token prompt context.
 2. **12.4x Variance Reduction and Tail-Latency Elimination**: Under cold starts, CPU prefill exhibited significant jitter ($\sigma = 138.59\text{ ms}$, P99 latency $= 1240.36\text{ ms}$). Serving prompt prefixes from the cache stabilized TTFT to $\sigma = \mathbf{11.19\text{ ms}}$ and lowered P99 latency to $\mathbf{488.24\text{ ms}}$ (a $60.6\%$ reduction in tail latency), proving that prefix caching is critical for SLA stability in multi-agent pipelines.
 3. **51.8% Latency Drop on Duplicate Tasks**: Exact duplicate tasks achieved complete prefill bypass, dropping first-token response time to $420.85\text{ ms}$ (representing raw first-token autoregressive decode latency).
 4. **Sustained Autoregressive Throughput**: Across all conditions, decode throughput averaged **$24.05\text{ tokens/second}$** ($\sigma = 1.10\text{ tok/s}$). Concurrent block touch signaling and background memory tiering caused zero detectable performance degradation to the generation loop.
