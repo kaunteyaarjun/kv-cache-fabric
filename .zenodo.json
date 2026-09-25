@@ -1,0 +1,38 @@
+{
+  "title": "Disaggregated KV-Cache Fabric: Hardware-Agnostic RAM-Tiering, PCIe DMA Eviction, and Fine-Grained Prefix Deduplication for Autonomous Agent Swarms",
+  "creators": [
+    {
+      "name": "Sethy, Somya Prasad",
+      "affiliation": "Independent Systems Research / Advanced Agentic Infrastructure"
+    }
+  ],
+  "description": "<p>Modern Large Language Model (LLM) serving systems face an acute memory wall dominated by Key-Value (KV) cache allocation rather than model weight storage. In multi-agent autonomous swarms—where dozens of concurrent agents share extensive system prompts, tool schemas, and branching conversational trajectories—the aggregate KV cache for 70B+ parameter models rapidly exceeds 80GB, triggering Out-Of-Memory (OOM) faults on modern high-bandwidth memory (HBM) accelerators.</p><p>We present <strong>KV-Cache Fabric</strong>, an open-source, disaggregated reference architecture designed to investigate hierarchical memory tiering and concurrent prefix deduplication across three co-designed subsystems:</p><ol><li><strong>A Tiered Physical Memory Manager in Rust</strong>, which backs logical blocks with contiguous host/device byte buffers, establishes a 90% watermark LRU eviction policy across simulated PCIe Direct Memory Access (DMA) seams, and eliminates the unlocked-snapshot race condition via optimistic two-phase write-lock re-verification.</li><li><strong>A Concurrent, Fine-Grained Radix Prefix Tree in Go</strong>, which eliminates global mutex contention through hand-over-hand lock coupling down the tree and commits physical block identifiers at strict 16-token boundaries.</li><li><strong>A Disaggregated Routing Conductor</strong>, which coordinates compute-bound prefill workers and memory-bound decode workers over gRPC, completely bypassing prefill on 100% prefix cache hits and prefilling only residual suffixes on partial hits.</li></ol><p>Evaluating the system under multi-agent swarm traffic shapes across both isolated control-plane dispatch benchmarks and live physical model inference with <code>SmolLM2-1.7B-Instruct</code> on an Intel CPU / Iris Xe platform demonstrates a <strong>46.1% reduction in real Time-To-First-Token (TTFT)</strong> on branching agent tasks, a <strong>12.4x reduction in latency variance</strong> (σ = 11.19 ms vs 138.59 ms), a <strong>51.8% TTFT reduction on duplicate queries</strong>, and sustained autoregressive decode throughput of <strong>24.05 tokens/second</strong> with active background memory tiering.</p>",
+  "keywords": [
+    "Key-Value Cache",
+    "LLM Serving",
+    "Prefix Caching",
+    "Radix Tree",
+    "Disaggregated Inference",
+    "Memory Tiering",
+    "PCIe DMA",
+    "Autonomous Agent Swarms",
+    "PagedAttention",
+    "vLLM",
+    "SGLang",
+    "Mooncake",
+    "DistServe",
+    "Computer Systems",
+    "Operating Systems"
+  ],
+  "license": "MIT",
+  "upload_type": "publication",
+  "publication_type": "preprint",
+  "access_right": "open",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/kaunteyaarjun/kv-cache-fabric",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}
