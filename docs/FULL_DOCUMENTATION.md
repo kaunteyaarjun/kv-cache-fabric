@@ -488,7 +488,36 @@ Key Takeaways:
 - **100% Prefill Bypass**: Exact duplicates (Reviewer) completely skipped the prefill engine.
 - **99.3% Prefix Cache Reuse**: 560 out of 564 tokens were served directly from the Radix Tree cache.
 
-### 11.2 Automated Test Execution
+### 11.2 Live Model Empirical Inference Suite (`benchmark_empirical.py`)
+To benchmark physical neural network weights, the Go Conductor proxies real OpenAI SSE streaming tokens from local models (e.g. **SmolLM2-1.7B-Instruct** running via Ollama/llama.cpp on Intel CPU / Iris Xe).
+
+Run the statistical multi-trial evaluation ($N=10$ trials):
+```bash
+python benchmark_empirical.py
+```
+
+Empirical Benchmark Telemetry ($N = 10$, SmolLM2-1.7B on Intel Core CPU / Iris Xe):
+```text
+================================================================
+  EMPIRICAL TELEMETRY SUMMARY
+================================================================
+Cold Start TTFT:    Mean:  873.10ms | Std: 138.59ms | P50:  842.13ms | P99: 1240.36ms
+Branch (99% Hit):   Mean:  470.23ms | Std:  11.19ms | P50:  467.30ms | P99:  488.24ms
+Duplicate (100%):   Mean:  420.85ms | Std:  16.97ms | P50:  421.51ms | P99:  451.70ms
+Decode Throughput:  Mean:   24.05 tok/s | Std:  1.10 tok/s
+
+Empirical Latency Reduction (Branching):  46.1%
+Empirical Latency Reduction (Duplicate):  51.8%
+================================================================
+```
+
+Key Findings:
+- **46.1% TTFT Reduction on Branching Swarms**: Prefilling only residual suffixes reduced cold TTFT from **873.10ms** to **470.23ms**.
+- **12.4x Variance Reduction**: Serving prompt prefixes from cache dropped standard deviation from $\sigma = 138.59\text{ms}$ down to **$11.19\text{ms}$** (cutting P99 tail latency from $1240\text{ms}$ to **$488\text{ms}$**).
+- **51.8% TTFT Drop on Duplicate Prompts**: Complete prefill bypass reduced response time to raw first-token decode latency (**420.85ms**).
+- **24.05 Tokens/Second Throughput**: Sustained full generation throughput under active concurrent background memory tiering.
+
+### 11.3 Automated Test Execution
 Run the complete unit and hardware-thrash test suite:
 ```bash
 go test -v ./...

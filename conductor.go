@@ -4,6 +4,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -101,6 +103,9 @@ type Conductor struct {
 	radixTree   *radixtree.Tree
 	kvClient    *kvclient.Client
 	seqCounter  uint64
+	backendURL  string
+	modelName   string
+	httpClient  *http.Client
 }
 
 func NewConductor(numPrefill, numDecode int, grpcAddr string) *Conductor {
@@ -114,7 +119,15 @@ func NewConductor(numPrefill, numDecode int, grpcAddr string) *Conductor {
 		decodePool:  NewWorkerPool("decode", numDecode),
 		radixTree:   radixtree.NewTree(),
 		kvClient:    client,
+		httpClient:  &http.Client{Timeout: 90 * time.Second},
 	}
+}
+
+// SetBackend configures an upstream LLM inference engine (e.g. Ollama or llama.cpp)
+// for executing real prefill and autoregressive token decoding.
+func (c *Conductor) SetBackend(url, model string) {
+	c.backendURL = url
+	c.modelName = model
 }
 
 // commitBlocksToTree commits physical block IDs at 16-token block boundaries into the Radix Tree.
@@ -174,13 +187,109 @@ func (c *Conductor) runPrefill(ctx context.Context, w *Worker, tokens []int, req
 	return blockIDs
 }
 
-// streamDecode generates tokens sequentially, refreshing the LRU access timestamp
-// on active KV blocks in the memory daemon so they remain pinned during active generation.
-func (c *Conductor) streamDecode(ctx context.Context, w *Worker, ref KVCacheReference, maxTokens int, out chan<- string) {
+// streamDecodeBackend forwards the prompt or residual suffix to an upstream LLM engine
+// (e.g. Ollama or llama.cpp OpenAI-compatible endpoint) and streams real tokens via SSE.
+func (c *Conductor) streamDecodeBackend(ctx context.Context, w *Worker, ref KVCacheReference, prompt string, maxTokens int, out chan<- string) error {
+	payload := map[string]interface{}{
+		"model": c.modelName,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"max_tokens": maxTokens,
+		"stream":     true,
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.backendURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := c.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("backend HTTP error: %d", resp.StatusCode)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	tokensGenerated := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "data: [DONE]" {
+			break
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		rawJSON := strings.TrimPrefix(line, "data: ")
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+
+		if err := json.Unmarshal([]byte(rawJSON), &chunk); err == nil {
+			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+				tokensGenerated++
+				out <- chunk.Choices[0].Delta.Content
+
+				// Periodically refresh active block timestamps in the memory daemon
+				if tokensGenerated%16 == 0 {
+					for _, blkStr := range ref.BlockIDs {
+						if bID, parseErr := kvclient.ParseBlockID(blkStr); parseErr == nil {
+							_ = c.kvClient.TouchBlock(ctx, bID)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return scanner.Err()
+}
+
+// streamDecode generates tokens sequentially, either from an active real model backend
+// or from simulated generation if no backend is reachable. It refreshes LRU access
+// timestamps on active KV blocks in the memory daemon.
+func (c *Conductor) streamDecode(ctx context.Context, w *Worker, ref KVCacheReference, prompt string, maxTokens int, out chan<- string) {
 	w.inc()
 	defer w.dec()
 	defer close(out)
 
+	if c.backendURL != "" && c.backendURL != "none" && c.backendURL != "mock" {
+		err := c.streamDecodeBackend(ctx, w, ref, prompt, maxTokens, out)
+		if err == nil {
+			// Real engine streaming finished successfully.
+			// Touch/unpin blocks after decode completes
+			for _, blkStr := range ref.BlockIDs {
+				if bID, parseErr := kvclient.ParseBlockID(blkStr); parseErr == nil {
+					_ = c.kvClient.TouchBlock(ctx, bID)
+				}
+			}
+			return
+		}
+		log.Printf("[conductor] live engine (%s) unavailable (%v); falling back to simulated generation", c.backendURL, err)
+	}
+
+	// Simulation fallback mode
 	vocab := []string{
 		"disaggregated", "kv-cache", "fabric", "accelerates", "inference",
 		"by", "reusing", "prefix", "tensors", "and", "tiering", "ram",
@@ -315,7 +424,7 @@ func (c *Conductor) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	tokenCh := make(chan string)
-	go c.streamDecode(ctx, decodeWorker, *ref, req.MaxTokens, tokenCh)
+	go c.streamDecode(ctx, decodeWorker, *ref, req.Prompt, req.MaxTokens, tokenCh)
 
 	// Emit metadata event
 	fmt.Fprintf(w, "event: meta\ndata: %s\n\n", mustJSON(ref))
@@ -408,7 +517,7 @@ func (c *Conductor) handleChatCompletions(w http.ResponseWriter, r *http.Request
 	}
 
 	tokenCh := make(chan string)
-	go c.streamDecode(ctx, decodeWorker, *ref, req.MaxTokens, tokenCh)
+	go c.streamDecode(ctx, decodeWorker, *ref, prompt, req.MaxTokens, tokenCh)
 
 	if req.Stream {
 		flusher, ok := w.(http.Flusher)
@@ -491,6 +600,16 @@ func main() {
 	}
 	conductor := NewConductor(4, 4, daemonAddr)
 
+	backendURL := os.Getenv("BACKEND_URL")
+	if backendURL == "" {
+		backendURL = "http://127.0.0.1:11434/v1/chat/completions"
+	}
+	modelName := os.Getenv("MODEL_NAME")
+	if modelName == "" {
+		modelName = "smollm2"
+	}
+	conductor.SetBackend(backendURL, modelName)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/generate", conductor.handleGenerate)
 	mux.HandleFunc("/v1/chat/completions", conductor.handleChatCompletions)
@@ -501,6 +620,7 @@ func main() {
 	}
 	addr := ":" + port
 	log.Printf("Disaggregated KV-Cache Conductor listening on %s (Daemon: %s)", addr, daemonAddr)
+	log.Printf("Real Inference Engine Backend: %s (Model: %s)", backendURL, modelName)
 	log.Printf(`Endpoints available:`)
 	log.Printf(`  - POST http://localhost%s/generate (SSE streaming)`, addr)
 	log.Printf(`  - POST http://localhost%s/v1/chat/completions (OpenAI compatible)`, addr)

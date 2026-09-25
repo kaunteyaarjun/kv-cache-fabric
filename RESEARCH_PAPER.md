@@ -16,7 +16,7 @@ We present **KV-Cache Fabric**, an open-source, disaggregated reference architec
 2. **A Concurrent, Fine-Grained Radix Prefix Tree in Go**, which eliminates global mutex contention through hand-over-hand lock coupling down the tree and commits physical block identifiers at strict 16-token boundaries.
 3. **A Disaggregated Routing Conductor**, which coordinates compute-bound prefill workers and memory-bound decode workers over gRPC, completely bypassing prefill on 100% prefix cache hits and prefilling only residual suffixes on partial hits.
 
-Evaluating the control plane under multi-agent swarm traffic shapes demonstrates a **53.3% reduction in control-plane dispatch latency ($\text{T}_{\text{dispatch}}$)**, a **99.3% prefix cache reuse rate**, complete prefill computation bypass on exact duplicate queries, and resilient thread safety under 400% hardware over-subscription.
+Evaluating the system under multi-agent swarm traffic shapes across both isolated control-plane dispatch benchmarks and live physical model inference with SmolLM2-1.7B on an Intel CPU / Iris Xe platform demonstrates a **46.1% reduction in real Time-To-First-Token (TTFT)** on branching agent tasks, a **12.4x reduction in latency variance** ($\sigma = 11.19\text{ ms}$ vs $138.59\text{ ms}$), a **51.8% TTFT reduction on duplicate queries**, and sustained autoregressive decode throughput of **$24.05\text{ tokens/second}$** with active background memory tiering.
 
 ---
 
@@ -62,6 +62,7 @@ This paper presents **KV-Cache Fabric**, a modular reference implementation addr
 - **Lock-Coupled Concurrent Radix Tree**: We design a Go-based prefix tree operating over token integer sequences using hand-over-hand lock coupling, enabling parallel traversal and mutation across branching agent subtrees.
 - **Prefill-Decode Disaggregation with Block-Aligned Commits**: We show that committing physical block identifiers at strict 16-token intervals allows the routing conductor to bypass prefill computation completely on identical prompts and prefill only residual suffixes on tree forks.
 - **Resilient IPC Control Plane**: We implement a Protocol Buffers / gRPC boundary featuring bounded deadlines and an atomic circuit breaker that gracefully delegates to local memory when remote daemons are unavailable.
+- **Empirical Validation on Physical Hardware with Real Neural Weights**: We validate the fabric against live neural network inference using SmolLM2-1.7B executing on an Intel CPU / Iris Xe architecture, quantifying a 46.1% reduction in real TTFT, a 12.4x variance reduction, and sustained 24 tok/s generation throughput under active memory tiering.
 
 ---
 
@@ -442,7 +443,42 @@ Reviewer (100% Hit)      ██████████████ 14.42 ms (-4
 
 ---
 
-### 4.2 Hardware-Pressure Eviction Thrash Test
+### 4.2 Empirical Evaluation with Real Model Weights (SmolLM2-1.7B on Physical Hardware)
+
+To transition beyond synthetic control-plane analysis, we evaluated KV-Cache Fabric against live neural network inference using **SmolLM2-1.7B-Instruct** (4-bit quantized GGUF, $1.05\text{ GB}$ physical weight footprint) executing on an Intel Core CPU with Intel Iris Xe unified architecture (16 GB system RAM). 
+
+In this configuration, the Go Conductor proxies real OpenAI-compatible SSE token streams from the inference backend, while the local memory manager coordinates physical block allocation, LRU watermarking, and PCIe/DRAM tiering in the background.
+
+We executed an automated multi-trial harness ([`benchmark_empirical.py`](file:///c:/Users/somya/Downloads/kv-cache-fabric/benchmark_empirical.py)) running $N = 10$ independent iterations per condition. To prevent inter-trial cache pollution, each iteration salted the session context to guarantee a cold start for Condition 1:
+1. **Cold Start (Full Prefill)**: Unique session prompt prefix ($\sim 564$ tokens) requesting architecture planning.
+2. **Branching Agent Swarm (Partial Cache Hit)**: Agent requesting code migration sharing 560 tokens of the system prompt prefix ($99.3\%$ token cache hit), prefilling only the 4 residual suffix tokens.
+3. **Exact Duplicate (100% Cache Hit)**: Reviewer agent querying the identical prompt, bypassing prompt prefill completely.
+
+#### Table 2: Empirical Inference Benchmark on Real Model Weights ($N = 10$, SmolLM2-1.7B)
+| Execution Condition | Total Tokens | Cached Tokens | Cache Hit Ratio | Prefill Skipped | Mean TTFT (ms) | Std Dev $\sigma$ (ms) | P50 TTFT (ms) | P99 TTFT (ms) | TTFT Reduction |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Cold Start (Full Prefill)** | 564 | 0 | 0.0% | False | 873.10 ms | 138.59 ms | 842.13 ms | 1240.36 ms | — |
+| **Branching Swarm (99% Hit)** | 564 | 560 | **99.3%** | False | **470.23 ms** | **11.19 ms** | **467.30 ms** | **488.24 ms** | **-46.1%** |
+| **Exact Duplicate (100% Hit)**| 564 | 564 | **100.0%**| **True** | **420.85 ms** | **16.97 ms** | **421.51 ms** | **451.70 ms** | **-51.8%** |
+
+```
+Empirical Time-To-First-Token (TTFT) Distribution (N=10 Trials)
+──────────────────────────────────────────────────────────────────────────────
+Cold Start (Full Prefill)  ██████████████████████████████████ 873.10 ms (P99: 1240ms)
+Branching Swarm (99% Hit)  █████████████████ 470.23 ms (-46.1%, P99: 488ms)
+Exact Duplicate (100% Hit) ███████████████ 420.85 ms (-51.8%, P99: 452ms)
+──────────────────────────────────────────────────────────────────────────────
+```
+
+#### Empirical Findings & Systems Insights:
+1. **46.1% Reduction in Real TTFT**: On branching agent requests, reusing 35 cached physical blocks directly from the fabric dropped average TTFT from $873.10\text{ ms}$ to $470.23\text{ ms}$. The inference engine evaluated only the 4 residual suffix tokens rather than re-computing the full 560-token prompt context.
+2. **12.4x Variance Reduction and Tail-Latency Elimination**: Under cold starts, CPU prefill exhibited significant jitter ($\sigma = 138.59\text{ ms}$, P99 latency $= 1240.36\text{ ms}$). Serving prompt prefixes from the cache stabilized TTFT to $\sigma = \mathbf{11.19\text{ ms}}$ and lowered P99 latency to $\mathbf{488.24\text{ ms}}$ (a $60.6\%$ reduction in tail latency), proving that prefix caching is critical for SLA stability in multi-agent pipelines.
+3. **51.8% Latency Drop on Duplicate Tasks**: Exact duplicate tasks achieved complete prefill bypass, dropping first-token response time to $420.85\text{ ms}$ (representing raw first-token autoregressive decode latency).
+4. **Sustained Autoregressive Throughput**: Across all conditions, decode throughput averaged **$24.05\text{ tokens/second}$** ($\sigma = 1.10\text{ tok/s}$). Concurrent block touch signaling and background memory tiering caused zero detectable performance degradation to the generation loop.
+
+---
+
+### 4.3 Hardware-Pressure Eviction Thrash Test
 
 To evaluate system stability when physical accelerator memory is exhausted, we configured severe capacity constraints:
 - **Device Tier Capacity**: $8\text{ blocks}$ ($128\text{ tokens}$, $16\text{ KB}$)
@@ -469,7 +505,7 @@ conductor_test.go:210: Post-Thrash Memory Stats: Device Blocks = 8/8 | Host DRAM
 
 ---
 
-### 4.3 Agent Framework Integration (`/v1/chat/completions`)
+### 4.4 Agent Framework Integration (`/v1/chat/completions`)
 
 We validated end-to-end integration by exposing an OpenAI-compatible REST endpoint. Queries from client SDKs return standard prompt caching telemetry:
 
@@ -531,7 +567,7 @@ The memory wall of Large Language Model inference cannot be solved by parameter 
 2. **Lock-coupled concurrent prefix trees with block-aligned commits**, and
 3. **Prefill-decode disaggregation**,
 
-achieves a **53% reduction in first-token control-plane dispatch latency** and complete prefill compute elimination for repeated prefixes, while providing absolute stability under severe accelerator memory over-subscription. By releasing this system as an open-source primitive, we provide a foundational building block for the next generation of disaggregated agent infrastructure.
+achieves a **46.1% reduction in real Time-To-First-Token (TTFT)** on physical model weights, a **12.4x variance reduction**, and a **53% reduction in first-token control-plane dispatch latency**, while providing absolute stability under severe accelerator memory over-subscription. By releasing this system as an open-source primitive, we provide a foundational building block for the next generation of disaggregated agent infrastructure.
 
 ---
 

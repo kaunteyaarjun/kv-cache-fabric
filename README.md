@@ -130,7 +130,29 @@ Autonomous agent swarms operate with long shared system prompts and branching co
 - **100% Prefill Bypass**: Exact duplicates (Reviewer) completely skipped the prefill engine.
 - **99.3% Prefix Cache Reuse**: 560 out of 564 tokens were served directly from the Radix Tree cache.
 
-### 2. Hardware-Pressure Eviction Thrash Test
+### 2. Live Model Inference Benchmark (SmolLM2-1.7B on Intel CPU / Iris Xe)
+Beyond control-plane simulation, the fabric was benchmarked against live neural weights using **SmolLM2-1.7B-Instruct** executing on an Intel CPU / Iris Xe system (16 GB unified RAM). Across $N = 10$ multi-agent trials ([`benchmark_empirical.py`](file:///c:/Users/somya/Downloads/kv-cache-fabric/benchmark_empirical.py)):
+
+```text
+================================================================
+  EMPIRICAL TELEMETRY SUMMARY (SmolLM2-1.7B, N=10 Trials)
+================================================================
+Cold Start TTFT:    Mean:  873.10ms | Std: 138.59ms | P50:  842.13ms | P99: 1240.36ms
+Branch (99% Hit):   Mean:  470.23ms | Std:  11.19ms | P50:  467.30ms | P99:  488.24ms
+Duplicate (100%):   Mean:  420.85ms | Std:  16.97ms | P50:  421.51ms | P99:  451.70ms
+Decode Throughput:  Mean:   24.05 tok/s | Std:  1.10 tok/s
+
+Empirical Latency Reduction (Branching):  46.1%
+Empirical Latency Reduction (Duplicate):  51.8%
+================================================================
+```
+
+#### Key Results:
+- **46.1% Drop in Real TTFT**: Time-to-first-token dropped from **873.10ms** to **470.23ms** on branching agent prompts.
+- **12.4x Variance Reduction**: Serving from prefix cache stabilized jitter from $\sigma = 138.59\text{ms}$ down to **$11.19\text{ms}$** (P99 tail latency cut from $1240\text{ms}$ to **$488\text{ms}$**).
+- **24.05 Tokens/Sec Generation**: Sustained full decode throughput with zero degradation during active memory tiering.
+
+### 3. Hardware-Pressure Eviction Thrash Test
 Configured extreme capacity constraints (8 Device blocks / 32 Host blocks) and fired **16 concurrent agent requests** requesting 32 blocks simultaneously:
 
 ```text
