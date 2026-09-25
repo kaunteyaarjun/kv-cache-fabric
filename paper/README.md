@@ -1,8 +1,8 @@
 # Disaggregated KV-Cache Fabric: LaTeX Paper & Preprint Submission Package
 
-This directory contains the publication-ready LaTeX paper and bibliography ready for submission to **Zenodo**, **TechRxiv**, **arXiv**, **Overleaf**, or systems conferences (EuroSys, OSDI, SOSP, USENIX ATC).
+This directory contains the publication-ready LaTeX paper and bibliography ready for submission to **Zenodo**, **Overleaf**, or systems conferences (EuroSys, OSDI, SOSP, USENIX ATC).
 
-> 📌 **Looking to publish?** See the complete guide with copy-paste metadata: [`docs/PREPRINT_SUBMISSION_GUIDE.md`](../docs/PREPRINT_SUBMISSION_GUIDE.md)
+> 📌 **Looking to cite or reference?** See the Zenodo record details: [`docs/PREPRINT_SUBMISSION_GUIDE.md`](../docs/PREPRINT_SUBMISSION_GUIDE.md)
 
 ---
 
@@ -22,9 +22,9 @@ This directory contains the publication-ready LaTeX paper and bibliography ready
 
 ---
 
-## 2. Publishing to Zenodo & TechRxiv
+## 2. Zenodo DOI Record
 
-See [`docs/PREPRINT_SUBMISSION_GUIDE.md`](../docs/PREPRINT_SUBMISSION_GUIDE.md) for the complete copy-paste metadata (Title, Abstract, Author, Keywords) to upload your compiled PDF directly.
+See [`docs/PREPRINT_SUBMISSION_GUIDE.md`](../docs/PREPRINT_SUBMISSION_GUIDE.md) for the official published record and BibTeX citation (`10.5281/zenodo.22966805`).
 
 ---
 

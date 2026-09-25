@@ -44,5 +44,6 @@ Thumbs.db
 *.out
 *.toc
 *.synctex.gz
+*.pdf
 paper/*.tar.gz
 paper/*.zip
