@@ -1,5 +1,6 @@
 {
   "title": "Disaggregated KV-Cache Fabric: Hardware-Agnostic RAM-Tiering, PCIe DMA Eviction, and Fine-Grained Prefix Deduplication for Autonomous Agent Swarms",
+  "doi": "10.5281/zenodo.22966805",
   "creators": [
     {
       "name": "Sethy, Somya Prasad",

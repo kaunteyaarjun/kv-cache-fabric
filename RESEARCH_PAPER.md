@@ -3,6 +3,7 @@
 **Author:** Somya Prasad Sethy ([@kaunteyaarjun](https://github.com/kaunteyaarjun))  
 **Affiliation:** Independent Systems Research / Advanced Agentic Infrastructure  
 **Date:** September 2026  
+**DOI:** [10.5281/zenodo.22966805](https://doi.org/10.5281/zenodo.22966805)  
 **Artifact Repository:** [https://github.com/kaunteyaarjun/kv-cache-fabric](https://github.com/kaunteyaarjun/kv-cache-fabric)
 
 ---

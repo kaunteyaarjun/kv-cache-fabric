@@ -1,17 +1,17 @@
 # Disaggregated KV-Cache Fabric
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22966805.svg)](https://doi.org/10.5281/zenodo.22966805)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](go.mod)
 [![Rust Version](https://img.shields.io/badge/Rust-2021-DEA584?style=flat&logo=rust)](Cargo.toml)
 [![Research Paper](https://img.shields.io/badge/Paper-Research%20Paper%20(Markdown)-8A2BE2)](RESEARCH_PAPER.md)
 [![LaTeX Source](https://img.shields.io/badge/LaTeX-Paper%20Source%20(main.tex)-b31b1b)](paper/main.tex)
-[![Preprint Guide](https://img.shields.io/badge/Preprint-Zenodo%20%26%20TechRxiv-00599C)](docs/PREPRINT_SUBMISSION_GUIDE.md)
 [![Documentation](https://img.shields.io/badge/Docs-Full%20Documentation-green)](docs/FULL_DOCUMENTATION.md)
 [![Architecture](https://img.shields.io/badge/Architecture-Prefill--Decode%20Disaggregation-FF6F00)](#architecture)
 
 > **Hardware-agnostic, disaggregated KV-cache memory fabric with RAM-tiering, prefix-sharing, and PCIe DMA eviction for autonomous LLM agent swarms.**  
 > *Engineered by **Somya Prasad Sethy** ([@kaunteyaarjun](https://github.com/kaunteyaarjun)).*  
-> 📄 **Read the Research Paper:** [Markdown](RESEARCH_PAPER.md) | [LaTeX Source](paper/main.tex) | 🚀 **Preprint Guide (Zenodo & TechRxiv):** [`docs/PREPRINT_SUBMISSION_GUIDE.md`](docs/PREPRINT_SUBMISSION_GUIDE.md) | 📚 **Full Documentation:** [`docs/FULL_DOCUMENTATION.md`](docs/FULL_DOCUMENTATION.md)
+> 🏛️ **Permanent DOI:** [https://doi.org/10.5281/zenodo.22966805](https://doi.org/10.5281/zenodo.22966805) | 📄 **Research Paper:** [Markdown](RESEARCH_PAPER.md) | [LaTeX Source](paper/main.tex) | 📚 **Full Documentation:** [`docs/FULL_DOCUMENTATION.md`](docs/FULL_DOCUMENTATION.md)
 
 ---
 
@@ -310,3 +310,22 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 **Author**: **Somya Prasad Sethy**  
 **GitHub / Legacy Handle**: [@kaunteyaarjun](https://github.com/kaunteyaarjun)
+
+---
+
+## Citation
+
+If you find this work or the KV-Cache Fabric architecture useful in your research, please cite:
+
+```bibtex
+@article{sethy2026kvfabric,
+  author       = {Sethy, Somya Prasad},
+  title        = {{Disaggregated KV-Cache Fabric: Hardware-Agnostic 
+                   RAM-Tiering, PCIe DMA Eviction, and Fine-Grained 
+                   Prefix Deduplication for Autonomous Agent Swarms}},
+  year         = {2026},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.22966805},
+  url          = {https://doi.org/10.5281/zenodo.22966805}
+}
+```
