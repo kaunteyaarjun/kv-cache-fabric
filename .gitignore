@@ -36,3 +36,13 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# LaTeX Build Artifacts & Generated Archives
+*.aux
+*.bbl
+*.blg
+*.out
+*.toc
+*.synctex.gz
+paper/*.tar.gz
+paper/*.zip

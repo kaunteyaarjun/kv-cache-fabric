@@ -3,13 +3,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](go.mod)
 [![Rust Version](https://img.shields.io/badge/Rust-2021-DEA584?style=flat&logo=rust)](Cargo.toml)
-[![Research Paper](https://img.shields.io/badge/Paper-Research%20Paper%20(PDF%2FMD)-8A2BE2)](RESEARCH_PAPER.md)
+[![Research Paper](https://img.shields.io/badge/Paper-Research%20Paper%20(Markdown)-8A2BE2)](RESEARCH_PAPER.md)
+[![arXiv LaTeX](https://img.shields.io/badge/arXiv-LaTeX%20Paper%20(main.tex)-b31b1b)](paper/main.tex)
 [![Documentation](https://img.shields.io/badge/Docs-Full%20Documentation-green)](docs/FULL_DOCUMENTATION.md)
 [![Architecture](https://img.shields.io/badge/Architecture-Prefill--Decode%20Disaggregation-FF6F00)](#architecture)
 
 > **Hardware-agnostic, disaggregated KV-cache memory fabric with RAM-tiering, prefix-sharing, and PCIe DMA eviction for autonomous LLM agent swarms.**  
 > *Engineered by **Somya Prasad Sethy** ([@kaunteyaarjun](https://github.com/kaunteyaarjun)).*  
-> 📄 **Read the Research Paper:** [`RESEARCH_PAPER.md`](RESEARCH_PAPER.md) | 📚 **Full Documentation & Post-Mortem:** [`docs/FULL_DOCUMENTATION.md`](docs/FULL_DOCUMENTATION.md)
+> 📄 **Read the Research Paper:** [Markdown](RESEARCH_PAPER.md) | [arXiv LaTeX Source](paper/main.tex) | 📦 [arXiv Bundle](paper/) | 📚 **Full Documentation:** [`docs/FULL_DOCUMENTATION.md`](docs/FULL_DOCUMENTATION.md)
 
 ---
 

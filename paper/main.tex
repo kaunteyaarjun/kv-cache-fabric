@@ -1,0 +1,460 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+% --- Packages ---
+\usepackage[margin=0.75in]{geometry}
+\usepackage{times}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{cite}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+% --- Listings Configuration ---
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.96,0.96,0.96}
+
+\lstdefinestyle{codebox}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{blue}\bfseries,
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    frame=single,
+    rulecolor=\color{black!20}
+}
+\lstset{style=codebox}
+
+% --- Title & Metadata ---
+\title{\Large\textbf{Disaggregated KV-Cache Fabric: Hardware-Agnostic RAM-Tiering, PCIe DMA Eviction, and Fine-Grained Prefix Deduplication for Autonomous Agent Swarms}}
+
+\author{
+  \textbf{Somya Prasad Sethy} \\
+  Independent Systems Research / Advanced Agentic Infrastructure \\
+  \texttt{somya5400840@gmail.com} \quad \href{https://github.com/kaunteyaarjun}{github.com/kaunteyaarjun} \\
+  \href{https://github.com/kaunteyaarjun/kv-cache-fabric}{https://github.com/kaunteyaarjun/kv-cache-fabric}
+}
+
+\date{September 2026}
+
+\begin{document}
+
+\maketitle
+
+% --- Abstract ---
+\begin{abstract}
+Modern Large Language Model (LLM) serving systems face an acute memory wall dominated by Key-Value (KV) cache allocation rather than model weight storage. In multi-agent autonomous swarms---where dozens of concurrent agents share extensive system prompts, tool schemas, and branching conversational trajectories---the aggregate KV cache for 70B+ parameter models rapidly exceeds 80\,GB, triggering Out-Of-Memory (OOM) faults on modern high-bandwidth memory (HBM) accelerators. 
+
+We present \textbf{KV-Cache Fabric}, an open-source, disaggregated reference architecture designed to investigate hierarchical memory tiering and concurrent prefix deduplication across three co-designed subsystems:
+\begin{enumerate}
+    \item \textbf{A Tiered Physical Memory Manager in Rust}, which backs logical blocks with contiguous host/device byte buffers, establishes a 90\% watermark LRU eviction policy across simulated PCIe Direct Memory Access (DMA) seams, and eliminates the \textit{unlocked-snapshot race condition} via optimistic two-phase write-lock re-verification.
+    \item \textbf{A Concurrent, Fine-Grained Radix Prefix Tree in Go}, which eliminates global mutex contention through hand-over-hand lock coupling down the tree and commits physical block identifiers at strict 16-token boundaries.
+    \item \textbf{A Disaggregated Routing Conductor}, which coordinates compute-bound prefill workers and memory-bound decode workers over gRPC, completely bypassing prefill on 100\% prefix cache hits and prefilling only residual suffixes on partial hits.
+\end{enumerate}
+Evaluating the system under multi-agent swarm traffic shapes across both isolated control-plane dispatch benchmarks and live physical model inference with \texttt{SmolLM2-1.7B-Instruct} on an Intel CPU / Iris Xe platform demonstrates a \textbf{46.1\% reduction in real Time-To-First-Token (TTFT)} on branching agent tasks, a \textbf{12.4$\times$ reduction in latency variance} ($\sigma = 11.19\,\text{ms}$ vs $138.59\,\text{ms}$), a \textbf{51.8\% TTFT reduction on duplicate queries}, and sustained autoregressive decode throughput of \textbf{24.05\,tokens/second} with active background memory tiering.
+\end{abstract}
+
+% --- Section 1: Introduction ---
+\section{Introduction}
+
+The serving economics of Large Language Models (LLMs) have undergone a fundamental shift. While early inference optimizations prioritized weight quantization (e.g., AWQ, GPTQ) and kernel fusion (e.g., FlashAttention~\cite{dao2022flashattention, dao2024flashattention2}), modern serving bottlenecks are overwhelmingly dictated by the \textbf{Key-Value (KV) Cache}.
+
+When generating sequences autoregressively, transformer attention mechanisms require storing intermediate Key and Value activation tensors for all preceding prompt and generated tokens across every attention layer:
+\begin{equation}
+\text{Mem}_{\text{KV}} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times T_{\text{ctx}} \times B \times \text{sizeof}(\text{dtype})
+\end{equation}
+
+For a 70-billion parameter model (e.g., LLaMA-3 70B with 80 layers, 8 KV heads, and head dimension 128 in FP16 precision), storing KV tensors consumes \textbf{320\,KB per token}. Serving a swarm of 32 concurrent agent workers with 8,192-token context windows demands \textbf{83.88\,GB of dedicated accelerator memory}---exceeding the entire physical High-Bandwidth Memory (HBM) capacity of an NVIDIA H100 (80\,GB) solely for dynamic attention state, leaving zero headroom for model weights or scratchpad activations.
+
+\subsection{The Emerging Autonomous Agent Workload Profile}
+Autonomous agent swarms do not generate isolated, independent query sequences. Instead, they exhibit distinct structural traffic shapes:
+\begin{enumerate}
+    \item \textbf{Long Shared System Prefixes}: Every agent in a swarm receives extensive common context: workspace policies, role specifications, execution constraints, and structured JSON tool definitions (typically 1,500 to 4,000 tokens).
+    \item \textbf{Branching Reasoning Trees}: A planner agent initiates a root task, which forks into concurrent worker branches (e.g., code generation, security auditing, test execution). These branches share 80--95\% of their initial prompt tokens.
+    \item \textbf{Context Window Thrashing}: Extended agentic feedback loops rapidly saturate local GPU VRAM. In monolithic serving engines (e.g., vLLM~\cite{kwon2023pagedattention} without external offload), VRAM saturation triggers query preemption or abrupt rejection.
+\end{enumerate}
+
+\subsection{Workload Characterization: Attention Memory Wall}
+In multi-agent architectures (such as CrewAI, LangGraph, or AutoGen), prompt prefix duplication across parallel agent personas drives severe accelerator memory pressure.
+
+Consider a 4-agent swarm executing against a 70B model in FP16 precision (320\,KB/token):
+\begin{itemize}
+    \item Each agent receives an identical 3,000-token system prompt containing environment rules, API contracts, and role guidelines.
+    \item The shared prefix alone consumes:
+    \begin{equation}
+    \text{Mem}_{\text{prefix}} = 4 \times 3{,}000 \times 320\,\text{KB} = 3.84\,\text{GB}
+    \end{equation}
+    \item As scratchpads, code snippets, and conversational history accumulate to 8,000 tokens per agent across iterative reasoning turns, the dynamic cache requirement reaches:
+    \begin{equation}
+    \text{Mem}_{\text{turn\_10}} = 4 \times 8{,}000 \times 320\,\text{KB} = \mathbf{10.24\,\text{GB}}
+    \end{equation}
+    \item Scaling to an enterprise deployment of 32 concurrent agents yields:
+    \begin{equation}
+    \text{Mem}_{\text{swarm\_32}} = 32 \times 8{,}000 \times 320\,\text{KB} = \mathbf{81.92\,\text{GB}}
+    \end{equation}
+\end{itemize}
+
+Crucially, because each agent executes in an isolated session, standard serving engines redundantly allocate disjoint physical memory blocks for identical token sequences. This observation motivates the need for global prefix deduplication paired with hierarchical offloading to lower-cost host memory.
+
+\subsection{Motivation \& Architectural Challenges}
+While recent breakthrough systems such as \textbf{SGLang}~\cite{zheng2023sglang} (RadixAttention) and \textbf{Mooncake}~\cite{mooncake2024} (Kimi) demonstrated the profound value of prefix caching and disaggregated memory pools, several systems challenges remain for general infrastructure:
+\begin{enumerate}
+    \item \textbf{Concurrency Bottlenecks}: Python-based control planes in early systems frequently rely on coarse-grained global locks, which experience severe mutex contention when dozens of concurrent agent workers query or mutate the prefix tree simultaneously.
+    \item \textbf{Hardware Accessibility}: Advanced disaggregation frameworks like Mooncake depend on datacenter-grade RDMA over Converged Ethernet (RoCEv2) meshes and specialized network interface cards (ConnectX-6/7), making deployment challenging in standard cloud compute environments.
+    \item \textbf{Control-Data Plane Separation}: Bridging a lightweight, high-concurrency compiled control plane (in Go) with a low-level, memory-safe tiering engine (in Rust) requires a modular IPC interface that can operate across local sockets before integrating directly with CUDA driver APIs.
+\end{enumerate}
+
+\subsection{Research Contributions}
+This paper presents \textbf{KV-Cache Fabric}, a modular reference implementation addressing these challenges. Our key contributions are:
+\begin{itemize}
+    \item \textbf{Identification and Resolution of the Lock-Release Eviction Race}: We analyze an asynchronous eviction race condition that arises during non-blocking DMA windows, and resolve it using an optimistic two-phase lock re-verification protocol.
+    \item \textbf{Lock-Coupled Concurrent Radix Tree}: We design a Go-based prefix tree operating over token integer sequences using hand-over-hand lock coupling, enabling parallel traversal and mutation across branching agent subtrees.
+    \item \textbf{Prefill-Decode Disaggregation with Block-Aligned Commits}: We show that committing physical block identifiers at strict 16-token intervals allows the routing conductor to bypass prefill computation completely on identical prompts and prefill only residual suffixes on tree forks.
+    \item \textbf{Resilient IPC Control Plane}: We implement a Protocol Buffers / gRPC boundary featuring bounded deadlines and an atomic circuit breaker that gracefully delegates to local memory when remote daemons are unavailable.
+    \item \textbf{Empirical Validation on Physical Hardware with Real Neural Weights}: We validate the fabric against live neural network inference using \texttt{SmolLM2-1.7B-Instruct} executing on an Intel CPU / Iris Xe architecture, quantifying a 46.1\% reduction in real TTFT, a 12.4$\times$ variance reduction, and sustained 24\,tok/s generation throughput under active memory tiering.
+\end{itemize}
+
+% --- Section 2: Background & Related Work ---
+\section{Background \& Related Work}
+
+\subsection{PagedAttention and Monolithic Block Allocation}
+vLLM~\cite{kwon2023pagedattention} introduced \textit{PagedAttention}, dividing continuous KV cache tensors into fixed-size physical blocks (typically 16 or 32 tokens), eliminating external fragmentation. However, standard PagedAttention implementations manage memory monolithically: blocks are allocated within accelerator HBM. When HBM is exhausted, requests are preempted, and their KV caches must either be discarded (requiring expensive full prefill recomputation) or swapped synchronously to CPU memory, stalling the GPU execution pipeline.
+
+\subsection{Radix-Based Prefix Caching (SGLang)}
+SGLang~\cite{zheng2023sglang} introduced \textit{RadixAttention}, retaining KV cache tensors in GPU memory across requests using a radix tree. While effective for single-GPU deployments, standard RadixAttention implementations employ coarse-grained global locking across the tree and do not disaggregate prefill computation from token decoding across a distributed cluster.
+
+\subsection{Disaggregated Prefill and Decode}
+Recent distributed inference research~\cite{zhong2024distserve, mooncake2024, agrawal2024sarathi, patel2024splitwise} has recognized that prefill (prompt processing) and decode (token generation) possess opposing computational characteristics:
+\begin{itemize}
+    \item \textbf{Prefill} is compute-bound, saturating tensor cores over large prompt batches with high arithmetic intensity.
+    \item \textbf{Decode} is memory-bandwidth bound, processing single tokens with low arithmetic intensity ($O(1)$ compute per memory access).
+\end{itemize}
+Projects like \textit{DistServe}~\cite{zhong2024distserve} and \textit{Mooncake}~\cite{mooncake2024} propose physical disaggregation: dedicated prefill nodes process incoming prompts and stream the resulting KV tensors across networks or PCIe buses to decode nodes. Mooncake's Transfer Engine leverages RDMA over RoCEv2. \textit{MemoryAlloy}~\cite{crusoe2025memoryalloy} explores host RAM tiering via PCIe/CXL. \textit{KV-Cache Fabric} builds upon these principles, providing an open, modular systems architecture implementing end-to-end prefix caching, PCIe DMA tiering, and agent swarm routing.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Architectural Lineage \& Design Influence Matrix across Modern LLM Serving Frameworks.}
+\label{tab:lineage}
+\begin{tabularx}{\textwidth}{p{3.2cm}p{3.2cm}Xp{4.2cm}}
+\toprule
+\textbf{System \& Reference} & \textbf{Core Contribution} & \textbf{Trade-offs in Prior Architectures} & \textbf{Adopted Design in KV-Cache Fabric} \\
+\midrule
+\textbf{vLLM}~\cite{kwon2023pagedattention} & PagedAttention, logical-to-physical block table, reference counting. & Focuses on single-node GPU HBM; CPU swapping synchronously blocks CUDA streams. & Adopted physical block table in \textbf{Rust}, extended with asynchronous 90\% watermark DMA eviction. \\
+\addlinespace
+\textbf{SGLang}~\cite{zheng2023sglang} & RadixCache: Radix tree for multi-turn prefix reuse. & Centralized in Python runtime; subject to mutex contention under concurrent swarms. & Re-engineered Radix Tree in \textbf{Go} with \textbf{hand-over-hand lock coupling}. \\
+\addlinespace
+\textbf{Mooncake}~\cite{mooncake2024} & Disaggregated KV pool with RDMA Transfer Engine. & Optimized for datacenter InfiniBand / RoCEv2 with ConnectX-6/7 NICs. & \textbf{Hardware-agnostic control plane} via gRPC and local DMA emulation. \\
+\addlinespace
+\textbf{DistServe}~\cite{zhong2024distserve} & Prefill-Decode disaggregation decoupling TTFT from TPOT. & Static worker role partitioning without dynamic prefix deduplication trees. & Integrated \textbf{prefill-decode disaggregation with dynamic Radix Tree}. \\
+\addlinespace
+\textbf{DeepSpeed-FastGen} & Dynamic Split-Fuse and CPU/NVMe memory offloading. & Oriented toward batch throughput; high scheduling overhead for streaming agents. & Lightweight Go proxy with low-latency Server-Sent Events (SSE) streaming. \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+% --- Section 3: Architecture & Design ---
+\section{System Architecture \& Design}
+
+KV-Cache Fabric is structured as a multi-tier disaggregated system comprising five tightly coupled components:
+
+\subsection{The Rust Local Memory Manager}
+The local memory manager (\texttt{main.rs}) manages physical memory allocations across two discrete hardware tiers:
+\begin{itemize}
+    \item \textbf{Device Tier ($\mathcal{T}_{\text{device}}$)}: Low-latency, capacity-constrained accelerator VRAM.
+    \item \textbf{Host Tier ($\mathcal{T}_{\text{host}}$)}: High-capacity, secondary host system DRAM accessible across PCIe.
+\end{itemize}
+
+Each physical block is modeled as:
+\begin{lstlisting}[language=Rust, caption={Physical block structure in Rust memory manager.}]
+pub struct PhysicalBlock {
+    pub block_id: BlockId,
+    pub tier: TierLocation,
+    pub last_accessed: Instant,
+    pub ref_count: u32,
+    pub num_tokens: usize,
+    pub data: Vec<u8>,
+}
+\end{lstlisting}
+where $\text{BLOCK\_SIZE} = 16$ tokens, $\text{BYTES\_PER\_TOKEN} = 128$ bytes, and each block allocates a contiguous buffer of $\text{BLOCK\_BYTES} = 2{,}048$ bytes.
+
+\subsubsection{Memory Tiering Invariants}
+The memory tiering architecture is governed by three systems concurrency invariants:
+\begin{enumerate}
+    \item \textbf{Pinned Allocation Safety}: Any block $b$ with $\text{ref\_count} > 0$ represents an in-flight query or active prefill/decode task. Pinned blocks are strictly ineligible for eviction or tier demotion.
+    \item \textbf{Hierarchical Lock Ordering}: To eliminate lock-order inversion deadlocks across memory tiers, operations requiring locks on both device and host tiers must acquire them in a strict hierarchy: $\mathcal{T}_{\text{device}}\text{.write()}$ precedes $\mathcal{T}_{\text{host}}\text{.write()}$.
+    \item \textbf{Optimistic Concurrency on Asynchronous Boundaries}: Because PCIe DMA transfers execute outside exclusive write lock windows, block metadata captured in a candidate snapshot is treated as optimistic and must be atomically re-verified against current tier state under an exclusive write lock prior to physical mutation.
+\end{enumerate}
+
+\subsection{Analysis and Resolution of the Asynchronous Eviction Race Condition}
+A naive implementation of asynchronous tiered memory eviction suffers from a severe concurrency flaw. Because PCIe DMA transfers incur significant latency, holding an exclusive write lock across the transfer serializes the entire memory manager. Consequently, naive systems take an unlocked snapshot of cold blocks:
+\begin{enumerate}
+    \item Evictor takes read lock on Device tier, filters candidates ($\text{ref\_count} == 0$), drops lock.
+    \item Evictor initiates asynchronous DMA copy across PCIe seam.
+    \item \textit{Race Window}: An incoming worker thread allocates or pins candidate block ($\text{ref\_count} = 1$) and writes active query activations.
+    \item Evictor DMA completes; acquires write lock on Device tier and unconditionally destroys block, corrupting live query attention tensors!
+\end{enumerate}
+
+\subsubsection{The Two-Phase Verification Protocol}
+To eliminate this race condition while retaining non-blocking asynchronous data movement, we implement the \textbf{Two-Phase Verification Protocol}:
+
+\begin{lstlisting}[language=Rust, caption={Two-Phase Verification Protocol in Rust.}]
+pub async fn evict_lru(&self) -> Result<usize, BlockManagerError> {
+    // Phase 1: Candidate Discovery (Read Lock)
+    let candidates: Vec<PhysicalBlock> = {
+        let device = self.device_tier.read().await;
+        device.blocks.values()
+            .filter(|b| b.ref_count == 0)
+            .cloned().collect()
+    };
+
+    let mut evicted = 0usize;
+    for block in candidates {
+        if self.device_tier.read().await.usage_ratio() 
+            < self.low_watermark { break; }
+
+        // Non-blocking DMA transfer window
+        tokio::time::sleep(Duration::from_micros(
+            20 * block.num_tokens as u64)).await;
+
+        // Phase 2: Hierarchical Lock & Re-verification
+        let mut device = self.device_tier.write().await;
+        let mut host = self.host_tier.write().await;
+
+        let is_still_evictable = match device.blocks.get(&block.block_id) {
+            Some(curr) => curr.ref_count == 0,
+            None => false,
+        };
+
+        if !is_still_evictable {
+            // Abort: block pinned or modified during transfer
+            continue;
+        }
+
+        if !host.has_room() {
+            return Err(BlockManagerError::HostOutOfMemory);
+        }
+
+        if let Some(mut moved) = device.remove(block.block_id) {
+            moved.tier = TierLocation::Host;
+            host.insert(moved);
+            drop(device);
+            drop(host);
+            self.block_table.write().await
+                .update_location(block.block_id, TierLocation::Host);
+            evicted += 1;
+        }
+    }
+    Ok(evicted)
+}
+\end{lstlisting}
+
+\subsection{Fine-Grained Concurrent Radix Tree}
+Prefix trees enable $O(L)$ lookup and deduplication of token sequences. However, protecting a radix tree with a single global mutex introduces severe CPU lock contention when hundreds of agent streams concurrently attempt lookups and insertions.
+
+We implement fine-grained synchronization where each \texttt{Node} maintains its own \texttt{sync.RWMutex}:
+\begin{lstlisting}[language=Go, caption={Fine-grained concurrent Radix Tree node struct in Go.}]
+type Node struct {
+    mu       sync.RWMutex
+    Tokens   []int
+    Metadata *CacheMetadata
+    Children map[int]*Node
+}
+\end{lstlisting}
+
+\begin{algorithm}[t]
+\caption{Lock-Coupled MatchPrefix}
+\label{alg:lock_coupling}
+\begin{algorithmic}[1]
+\Require Token sequence $S = [t_0, t_1, \dots, t_{n-1}]$
+\Ensure $\text{MatchedTokens}, \text{BlockIDs}, \text{RemainingTokens}$
+\State $\text{curr} \gets \text{Tree.root}$
+\State $\text{curr.mu.RLock}()$
+\While{$|\text{remaining}| > 0$}
+    \State $\text{first} \gets \text{remaining}[0]$
+    \If{$\text{first} \notin \text{curr.Children}$}
+        \State $\text{curr.mu.RUnlock}()$
+        \State \textbf{break}
+    \EndIf
+    \State $\text{child} \gets \text{curr.Children}[\text{first}]$
+    \State $\text{child.mu.RLock}()$ \Comment{Acquire child lock}
+    \State $\text{curr.mu.RUnlock}()$ \Comment{Release parent lock}
+    \State $\text{curr} \gets \text{child}$
+    \State $\text{common} \gets \text{CommonPrefixLength}(\text{curr.Tokens}, \text{remaining})$
+    \If{$\text{common} < |\text{curr.Tokens}|$}
+        \State $\text{curr.mu.RUnlock}()$
+        \State \textbf{break}
+    \EndIf
+    \State $\text{matched.append}(\text{curr.Tokens})$
+    \If{$\text{curr.Metadata} \neq \text{nil}$}
+        \State $\text{blockIDs.append}(\text{curr.Metadata.BlockID})$
+    \EndIf
+    \State $\text{remaining} \gets \text{remaining}[\text{common}:]$
+\EndWhile
+\State \Return $\text{matched}, \text{blockIDs}, \text{remaining}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Block-Aligned Boundary Commits}
+KV cache tensors can only be transferred and reused as integer multiples of physical blocks ($\text{BLOCK\_SIZE} = 16$). If metadata were committed only at prompt leaf nodes, intermediate shared blocks would remain anonymous. The Conductor enforces block-aligned boundary commits:
+\begin{equation}
+\forall k \in \left\{1, \dots, \left\lceil \frac{|S|}{16} \right\rceil \right\}, \quad \text{Tree.Insert}(S[0 : \min(16k, |S|)], \text{BlockID}_k)
+\end{equation}
+This ensures that any subsequent request sharing a prefix of length $L \ge 16$ immediately recovers the exact sequence of physical block identifiers $\lfloor L / 16 \rfloor$.
+
+\subsection{Disaggregated Conductor}
+The Conductor acts as the intelligent routing proxy between external clients and the inference cluster. It maintains a \texttt{prefillPool} and a \texttt{decodePool}, tracking worker load via active request counters.
+
+When a request arrives with prompt $P$:
+\begin{enumerate}
+    \item \textbf{Tokenization}: $S = \text{Tokenize}(P)$.
+    \item \textbf{Prefix Inspection}: $\mathcal{M} = \text{RadixTree.MatchPrefix}(S)$.
+    \item \textbf{Branch Selection}:
+    \begin{itemize}
+        \item \textbf{100\% Cache Hit} ($|\mathcal{M}.\text{RemainingTokens}| = 0$): Prefill is completely bypassed (\texttt{prefill\_skipped: true}). Cached \texttt{BlockIDs} are dispatched directly to the least-loaded decode worker.
+        \item \textbf{Partial Cache Hit} ($|\mathcal{M}.\text{MatchedTokens}| > 0$): Only remaining suffix tokens are sent to a prefill worker. Newly allocated blocks are committed to the tree and routed to decode.
+        \item \textbf{Cache Miss} ($|\mathcal{M}.\text{MatchedTokens}| = 0$): Full sequence is prefilled, committed to the tree, and routed to decode.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Systems Invariants and Concurrency Considerations}
+\begin{itemize}
+    \item \textbf{Dynamic Host DRAM Overflow}: When concurrent requests saturate accelerator memory with in-flight pinned blocks ($\text{ref\_count} > 0$), new allocations dynamically spill into Host DRAM, preserving availability without dropping requests.
+    \item \textbf{Circuit Breaking}: All IPC calls carry a 250\,ms context deadline. Consecutive failures trip an internal atomic compare-and-swap circuit breaker, redirecting memory operations to an embedded local engine with zero nanoseconds network overhead.
+    \item \textbf{Disjoint ID Namespace Partitioning}: Remote accelerator blocks occupy $[1, 999{,}999]$, while local fallback allocations occupy $[1{,}000{,}000, \infty)$, preventing block collision across failover transitions.
+\end{itemize}
+
+% --- Section 4: Empirical Evaluation ---
+\section{Empirical Evaluation}
+
+We evaluated KV-Cache Fabric across both control-plane dispatch benchmarks and live physical model inference.
+
+\subsection{Multi-Agent Workload Simulator Benchmark}
+To isolate control-plane routing, lock coupling, and memory management overheads from model FLOP execution times, our evaluation first benchmarks the Go Conductor and Rust daemon using a multi-agent workload simulator (\texttt{benchmark\_agents.py}).
+
+The benchmark simulates an autonomous software development swarm sharing an extensive system prompt prefix ($\sim 560$ tokens) specifying agent personas, formatting rules, and tool calling definitions. Four heterogeneous agents are evaluated:
+\begin{enumerate}
+    \item \textbf{Planner (Cold Start)}: Base system prompt + \textit{"Task: Plan database schema."}
+    \item \textbf{Coder (Branch A)}: Base system prompt + \textit{"Task: Write Rust migrations."}
+    \item \textbf{Auditor (Branch B)}: Base system prompt + \textit{"Task: Audit locks and memory leaks."}
+    \item \textbf{Reviewer (Exact Duplicate)}: Base system prompt + \textit{"Task: Plan database schema."}
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Multi-Agent Control-Plane Dispatch Benchmark.}
+\label{tab:control_plane}
+\begin{tabularx}{\columnwidth}{lcccc}
+\toprule
+\textbf{Agent} & \textbf{Mode} & \textbf{Hit Ratio} & \textbf{Skip Prefill} & $\mathbf{T_{\text{dispatch}}}$ \\
+\midrule
+\textbf{Planner}  & Cold Start & 0.0\%  & False & 27.58\,ms \\
+\textbf{Coder}    & Branch A   & 99.3\% & False & \textbf{12.87\,ms} \\
+\textbf{Auditor}  & Branch B   & 99.1\% & False & 14.82\,ms \\
+\textbf{Reviewer} & Duplicate  & 100.0\%& \textbf{True}  & 14.42\,ms \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+As shown in Table~\ref{tab:control_plane}, branching agent lookups achieved a \textbf{53.3\% reduction in first-token dispatch latency} ($T_{\text{dispatch}}$ dropped from 27.58\,ms to 12.87\,ms) because 35 physical blocks were resolved directly from the Radix Tree. The Reviewer agent achieved a 100\% hit, bypassing prefill computation completely.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Empirical Telemetry Under Multi-Agent Swarm Workloads ($N=10$ Trials, \texttt{SmolLM2-1.7B-Instruct} on Intel CPU / Iris Xe).}
+\label{tab:empirical_results}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Workload Condition} & \textbf{Tokens (Total / Cached)} & \textbf{Cache Hit} & \textbf{Mean TTFT $\pm \sigma$ (ms)} & \textbf{P50 TTFT (ms)} & \textbf{P99 TTFT (ms)} & \textbf{Throughput (tok/s)} \\
+\midrule
+\textbf{Cold Start (Planner)}       & $566\ /\ 0$   & $0.0\%$   & $873.10 \pm 138.59$ & $842.13$ & $1240.36$ & $23.82 \pm 1.15$ \\
+\textbf{Branching Swarm (Coder)}    & $566\ /\ 561$ & $99.1\%$  & $470.23 \pm 11.19$  & $467.30$ & $488.24$  & $24.11 \pm 0.95$ \\
+\textbf{Exact Duplicate (Reviewer)} & $566\ /\ 566$ & $100.0\%$ & $420.85 \pm 16.97$  & $421.51$ & $451.70$  & $24.23 \pm 1.05$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Empirical Evaluation with Real Model Weights (SmolLM2-1.7B on Physical Hardware)}
+To validate the fabric beyond synthetic control planes, we evaluated the system against live neural network inference using \textbf{SmolLM2-1.7B-Instruct} (4-bit quantized GGUF, 1.05\,GB physical weight footprint) executing under AVX2 acceleration on an Intel CPU / Iris Xe platform (16\,GB unified system memory).
+
+The Go Conductor proxies real OpenAI SSE streaming tokens from the backend while managing prefix caching and memory tiering in the background. We conducted an automated multi-trial evaluation (\texttt{benchmark\_empirical.py}) executing $N = 10$ independent iterations per condition with salted prompt prefixes to guarantee cold initial state.
+
+Table~\ref{tab:empirical_results} details the measured empirical distributions:
+\begin{enumerate}
+    \item \textbf{46.1\% Reduction in Real TTFT}: On branching agent requests (99.1\% hit), reusing 35 cached physical blocks directly from the fabric dropped average TTFT from $873.10\,\text{ms}$ to $470.23\,\text{ms}$. The neural inference engine evaluated only the 5 residual suffix tokens rather than re-computing the entire 561-token prefix.
+    \item \textbf{12.4$\times$ Variance Reduction and Tail-Latency Elimination}: Cold start prefill exhibited high latency jitter ($\sigma = 138.59\,\text{ms}$, P99 $= 1240.36\,\text{ms}$). Prefix caching stabilized TTFT to $\sigma = \mathbf{11.19\,\text{ms}}$ and reduced P99 tail latency to $\mathbf{488.24\,\text{ms}}$ (a 60.6\% reduction in P99 tail latency).
+    \item \textbf{51.8\% Latency Drop on Duplicates}: Exact duplicate queries bypassed prefill entirely, reducing TTFT to $420.85\,\text{ms}$ (representing pure autoregressive first-token decode latency).
+    \item \textbf{Sustained Autoregressive Throughput}: Generation throughput averaged \textbf{24.05\,tokens/second} ($\sigma = 1.10\,\text{tok/s}$). Active background memory tiering and block touch signaling caused zero detectable degradation to the decode loop.
+\end{enumerate}
+
+\subsection{Hardware-Pressure Eviction Thrash Test}
+To evaluate system stability under extreme memory saturation, we configured severe capacity limits:
+\begin{itemize}
+    \item \textbf{Device Tier}: 8 blocks (128 tokens, 16\,KB)
+    \item \textbf{Host Tier}: 32 blocks (512 tokens, 64\,KB)
+\end{itemize}
+We subjected the system to \textbf{16 concurrent agent requests}, each requesting 2 blocks ($16 \times 2 = 32$ blocks requested simultaneously against an 8-block device tier---a \textbf{400\% over-subscription}).
+\begin{itemize}
+    \item \textbf{Zero Deadlocks}: All 16 concurrent goroutines completed cleanly without lock acquisition timeouts.
+    \item \textbf{Watermark Regulation}: As device tier occupancy reached $\ge 90\%$, \texttt{evict\_lru} migrated unpinned cold blocks across the simulated PCIe seam into Host DRAM, restoring capacity to the 70\% low watermark.
+    \item \textbf{Graceful Host Schedulability}: When device VRAM was saturated with active pinned blocks ($\text{ref\_count} > 0$), new allocations dynamically overflowed to Host DRAM, servicing all requests without dropping queries or raising OOM errors.
+\end{itemize}
+
+\subsection{Agent Framework Integration}
+We verified end-to-end integration by exposing an OpenAI-compatible REST endpoint (\texttt{/v1/chat/completions}). Standard client SDKs (CrewAI, LangGraph, AutoGen) connect out of the box by setting \texttt{OPENAI\_BASE\_URL = "http://localhost:8080/v1"}, receiving native prompt cache attribution in \texttt{usage.prompt\_tokens\_details.cached\_tokens}.
+
+% --- Section 5: Discussion ---
+\section{Discussion \& Future Directions}
+
+\subsection{Hardware DMA and CXL Integration}
+While our reference prototype models transfer latencies via asynchronous microsecond yields, the memory tiering interfaces in \texttt{main.rs} are designed as direct integration points for \texttt{cudaMemcpyAsync}, GPUDirect Storage (GDS), or Compute Express Link (CXL) shared memory pools.
+
+\subsection{Distributed Raft-Backed Prefix Tree}
+In multi-conductor cluster deployments, the prefix tree can be synchronized across nodes via a distributed consensus protocol (e.g., Raft) or an external key-value metadata fabric.
+
+\subsection{Zero-Copy PagedAttention Integration via C-ABI}
+To transition to production serving engines (\textbf{vLLM}, \textbf{TensorRT-LLM}), we propose control-data plane disaggregation:
+\begin{enumerate}
+    \item \textbf{Control Plane (Go Conductor)}: Dispatches lightweight prefix block IDs and scheduling decisions over gRPC ($< 100\,\mu\text{s}$).
+    \item \textbf{Data Plane (\texttt{libkvfabric.so} C-ABI)}: Exposes native C-ABI functions into Python serving engines via \texttt{ctypes} or \texttt{PyO3}, directly mapping to PagedAttention's 5D physical tensor pools (\texttt{key\_cache}, \texttt{value\_cache}) and \texttt{block\_table} arrays.
+    \item \textbf{Direct Memory Access (DMA)}: Issues non-blocking asynchronous DMA transfers (\texttt{cudaMemcpyAsync}) between accelerator VRAM and pinned Host DRAM (\texttt{cudaHostAlloc}) across dedicated CUDA streams, achieving full 32--64\,GB/s PCIe wire-speed without user-space buffer duplication.
+\end{enumerate}
+
+% --- Section 6: Conclusion ---
+\section{Conclusion}
+The memory wall of Large Language Model inference cannot be solved by parameter optimization alone. As autonomous agent swarms become the primary consumers of AI compute, memory architectures must adapt to hierarchical, tree-structured traffic shapes.
+
+\textbf{KV-Cache Fabric} demonstrates that combining:
+\begin{enumerate}
+    \item PCIe RAM-tiering with race-free eviction verification,
+    \item Lock-coupled concurrent prefix trees with block-aligned commits, and
+    \item Prefill-decode disaggregation,
+\end{enumerate}
+achieves a \textbf{46.1\% reduction in real TTFT} on physical model weights, a \textbf{12.4$\times$ variance reduction}, and a \textbf{53\% reduction in control-plane dispatch latency}, while guaranteeing stability under severe accelerator memory over-subscription. Released as an open-source primitive, KV-Cache Fabric provides a foundational building block for disaggregated agent serving systems.
+
+% --- References ---
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
